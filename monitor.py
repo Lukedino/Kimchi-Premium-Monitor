@@ -380,7 +380,30 @@ def main():
     print(f"  요약: 테더 김프={usdt_str} | 금 김프={gold_str}")
     print(f"  조건: 테더 ≤{USDT_KIMP_LOW}% | 금 ≤{GOLD_KIMP_LOW}% 또는 ≥{GOLD_KIMP_HIGH}%")
 
-    if alerts:
+    # 수동 실행 시 항상 현재 상태 리포트 전송
+    run_mode = os.environ.get("RUN_MODE") or ""
+    is_manual = run_mode == "workflow_dispatch"
+
+    if is_manual and not alerts:
+        report = (
+            f"📊 <b>김프 현황 리포트</b> (수동 조회)\n\n"
+            f"테더 김프: <b>{usdt_str}</b>\n"
+            f"금 김프: <b>{gold_str}</b>\n"
+        )
+        if usdt_kimp is not None:
+            report += f"\nUpbit USDT: {upbit_usdt:,.0f}원\n"
+            report += f"환율: {usd_krw:,.2f}원\n"
+        if gold_kimp is not None:
+            report += f"\n국내 금: {krx_gold:,.0f}원/g\n"
+            report += f"국제 금: {intl_gold_krw_g:,.0f}원/g (${intl_gold_oz:,.2f}/oz)\n"
+        report += (
+            f"\n기준: 테더 ≤{USDT_KIMP_LOW}% | 금 ≤{GOLD_KIMP_LOW}% 또는 ≥{GOLD_KIMP_HIGH}%\n"
+            f"✅ 현재 정상 범위\n"
+            f"⏰ {now.strftime('%Y-%m-%d %H:%M KST')}"
+        )
+        send_telegram(report)
+        print(f"\n  📊 수동 실행 — 현황 리포트 전송!")
+    elif alerts:
         print(f"\n  🚨 알림 {len(alerts)}건 발송!")
         send_telegram("\n\n".join(alerts))
     else:
@@ -391,6 +414,7 @@ def main():
         save_state(state)
 
     print(f"{'='*55}\n")
+
 
 
 if __name__ == "__main__":
