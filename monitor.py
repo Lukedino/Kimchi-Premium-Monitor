@@ -73,103 +73,45 @@ def get_usd_krw_rate() -> float:
 
 def get_krx_gold_price_per_gram() -> float:
     """
-    네이버 증권에서 KRX 금현물 1g 가격(원) 크롤링
-    여러 URL과 패턴을 시도하여 안정성 확보
+    네이버 증권 내부 API로 KRX 금현물 1g 가격(원) 조회
     """
-    sources = [
-        # 소스 1: 네이버 모바일
-        {
-            "url": "https://m.stock.naver.com/marketindex/metals/M04020000",
-            "headers": {
-                "User-Agent": (
-                    "Mozilla/5.0 (Linux; Android 13) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/120.0.0.0 Mobile Safari/537.36"
-                )
-            },
-        },
-        # 소스 2: 네이버 시세 API (금현물 ETF)
-        {
-            "url": "https://api.stock.naver.com/etf/411060/basic",
-            "headers": {"User-Agent": "Mozilla/5.0"},
-        },
-        # 소스 3: 네이버 데스크톱
-        {
-            "url": "https://finance.naver.com/marketindex/goldDaily498498.naver",
-            "headers": {"User-Agent": "Mozilla/5.0"},
-        },
-    ]
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    }
 
-    # ── 소스 1: 모바일 페이지 크롤링 ──
+    # 소스 1: 네이버 증권 API (JSON) — 가장 안정적
     try:
-        src = sources[0]
-        resp = requests.get(src["url"], headers=src["headers"], timeout=15)
-        resp.raise_for_status()
-        text = resp.text
-
-        # 패턴들 시도
-        patterns = [
-            r"([\d,]+)\s*원/g",                    # "233,910원/g"
-            r'"currentPrice"\s*:\s*"?([\d,.]+)"?',  # JSON 내 currentPrice
-            r'금.*?([\d]{3},[\d]{3})\s*원',         # "금 현물 233,910원"
-            r'class="price"[^>]*>([\d,]+)',          # <span class="price">233910
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text)
-            if match:
-                price = float(match.group(1).replace(",", ""))
-                if 50_000 < price < 1_000_000:  # 합리적 범위 검증
-                    print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g (모바일)")
-                    return price
-        print(f"  [KRX Gold] 모바일 파싱 실패, 응답 길이={len(text)}")
-    except Exception as e:
-        print(f"  [KRX Gold] 모바일 조회 실패: {e}")
-
-    # ── 소스 2: 네이버 ETF API → 금 1g 가격으로 환산 ──
-    try:
-        src = sources[1]
-        resp = requests.get(src["url"], headers=src["headers"], timeout=15)
+        url = "https://api.stock.naver.com/marketindex/metals/M04020000"
+        resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         data = resp.json()
-        # ETF 현재가 추출
-        etf_price = None
-        for key in ["closePrice", "nowVal", "stckPrpr"]:
-            if key in data:
-                etf_price = float(str(data[key]).replace(",", ""))
-                break
-        if etf_price is None and "currentPrice" in str(data):
-            match = re.search(r'"currentPrice"\s*:\s*"?([\d,.]+)"?', str(data))
-            if match:
-                etf_price = float(match.group(1).replace(",", ""))
-
-        if etf_price:
-            # ACE KRX금현물 ETF: 1주 ≈ 0.1454g (변동 가능, 근사값)
-            gold_per_gram = etf_price / 0.1454
-            if 50_000 < gold_per_gram < 1_000_000:
-                print(f"  [KRX Gold] 국내 금현물 ≈ {gold_per_gram:,.0f} 원/g (ETF 환산)")
-                return gold_per_gram
-        print(f"  [KRX Gold] ETF API 파싱 실패")
+        price = float(data["closePrice"].replace(",", ""))
+        print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g (네이버 API)")
+        return price
     except Exception as e:
-        print(f"  [KRX Gold] ETF API 실패: {e}")
+        print(f"  [KRX Gold] 네이버 API 실패: {e}")
 
-    # ── 소스 3: 네이버 데스크톱 금시세 페이지 ──
+    # 소스 2: 네이버 데스크톱 금시세 페이지 크롤링 (폴백)
     try:
-        src = sources[2]
-        resp = requests.get(src["url"], headers=src["headers"], timeout=15)
+        url = "https://finance.naver.com/marketindex/goldDetail.naver"
+        resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         text = resp.text
-        match = re.search(r"([\d,]+)\s*원", text)
+        match = re.search(r"([\d,]+\.\d+)\s*원/g", text)
         if match:
             price = float(match.group(1).replace(",", ""))
-            if 50_000 < price < 1_000_000:
-                print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g (데스크톱)")
-                return price
+            print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g (데스크톱)")
+            return price
+        # 정수 패턴도 시도
+        match = re.search(r"([\d,]+)\s*원/g", text)
+        if match:
+            price = float(match.group(1).replace(",", ""))
+            print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g (데스크톱)")
+            return price
     except Exception as e:
-        print(f"  [KRX Gold] 데스크톱 조회 실패: {e}")
+        print(f"  [KRX Gold] 데스크톱 실패: {e}")
 
     raise RuntimeError("KRX 금현물 가격을 파싱할 수 없습니다.")
-
-
 
 def get_international_gold_usd_per_oz() -> float:
     ticker = yf.Ticker("GC=F")
