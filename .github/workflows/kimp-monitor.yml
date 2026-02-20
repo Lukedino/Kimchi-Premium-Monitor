@@ -13,6 +13,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -27,11 +29,8 @@ jobs:
           RUN_MODE: ${{ github.event_name }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
-          GIST_ID: ${{ secrets.GIST_ID }}
           USDT_KIMP_LOW: ${{ vars.USDT_KIMP_LOW }}
           USDT_KIMP_HIGH: ${{ vars.USDT_KIMP_HIGH }}
           GOLD_KIMP_LOW: ${{ vars.GOLD_KIMP_LOW }}
           GOLD_KIMP_HIGH: ${{ vars.GOLD_KIMP_HIGH }}
-          ALERT_GAP: ${{ vars.ALERT_GAP }}
         run: python monitor.py
