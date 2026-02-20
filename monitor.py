@@ -176,16 +176,45 @@ def get_krx_gold_price_per_gram() -> float:
 
 
 def get_international_gold_usd_per_oz() -> float:
-    ticker = yf.Ticker("GC=F")
+    """
+    국제 금 현물(XAU/USD spot) 가격 조회
+    소스 1: Swissquote 공개 피드 (API 키 불필요, 현물)
+    소스 2: yfinance GC=F (선물, 폴백)
+    """
+    # 소스 1: Swissquote — XAU/USD 현물 (무료, 키 불필요)
     try:
-        price = ticker.fast_info.last_price
-    except Exception:
-        hist = ticker.history(period="1d")
-        if hist.empty:
-            raise RuntimeError("yfinance에서 금 시세를 가져올 수 없습니다.")
-        price = float(hist["Close"].iloc[-1])
-    print(f"  [Yahoo] 국제 금 = ${price:,.2f}/oz")
-    return float(price)
+        url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        # 첫 번째 플랫폼의 premium 프로필에서 mid price 계산
+        prices = data[0]["spreadProfilePrices"][0]
+        bid = prices["bid"]
+        ask = prices["ask"]
+        spot = (bid + ask) / 2
+        print(f"  [Swissquote] 국제 금 현물 = ${spot:,.2f}/oz (bid ${bid:,.2f} / ask ${ask:,.2f})")
+        return spot
+    except Exception as e:
+        print(f"  [Swissquote] 실패: {e}")
+
+    # 소스 2: yfinance GC=F (선물, 폴백)
+    try:
+        print("  [Yahoo] 폴백: 선물(GC=F) 사용")
+        ticker = yf.Ticker("GC=F")
+        try:
+            price = ticker.fast_info.last_price
+        except Exception:
+            hist = ticker.history(period="1d")
+            if hist.empty:
+                raise RuntimeError("yfinance 데이터 없음")
+            price = float(hist["Close"].iloc[-1])
+        print(f"  [Yahoo] 국제 금 선물 = ${price:,.2f}/oz (현물 대비 ~$20-40 높음)")
+        return float(price)
+    except Exception as e:
+        print(f"  [Yahoo] 실패: {e}")
+
+    raise RuntimeError("국제 금 시세를 가져올 수 없습니다.")
+
 
 
 # ═══════════════════════════════════════════════════════
