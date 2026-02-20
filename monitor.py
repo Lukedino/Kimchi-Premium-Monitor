@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
 김치프리미엄 모니터 — 테더 김프 & 금 김프
-- 테더 김프: Upbit USDT/KRW vs USD/KRW 환율
-- 금 김프: KRX 금현물(네이버) vs 국제 금시세(yfinance) + 환율
-- 알림: 텔레그램 봇
-- 시그널 시 Private repo dispatch (선택)
+스마트 알림: 최초 알림 후 급변(gap) 시에만 재알림
 """
 
 import os
@@ -21,14 +18,93 @@ KST = timezone(timedelta(hours=9))
 TROY_OUNCE_TO_GRAM = 31.1035
 
 # ─── 환경변수 ───────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-DISPATCH_PAT = os.environ.get("DISPATCH_PAT", "")
-DISPATCH_REPO = os.environ.get("DISPATCH_REPO", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID") or ""
 
-USDT_KIMP_LOW = float(os.environ.get("USDT_KIMP_LOW", "0"))
-GOLD_KIMP_LOW = float(os.environ.get("GOLD_KIMP_LOW", "0"))
-GOLD_KIMP_HIGH = float(os.environ.get("GOLD_KIMP_HIGH", "10"))
+USDT_KIMP_LOW = float(os.environ.get("USDT_KIMP_LOW") or "0")
+GOLD_KIMP_LOW = float(os.environ.get("GOLD_KIMP_LOW") or "0")
+GOLD_KIMP_HIGH = float(os.environ.get("GOLD_KIMP_HIGH") or "10")
+
+# 재알림 기준: 이전 알림값 대비 이만큼 변하면 재알림 (%p 단위)
+ALERT_GAP = float(os.environ.get("ALERT_GAP") or "0.5")
+
+# Gist 상태 저장
+GIST_TOKEN = os.environ.get("GIST_TOKEN") or ""
+GIST_ID = os.environ.get("GIST_ID") or ""
+GIST_FILENAME = "kimp_alert_state.json"
+
+
+# ═══════════════════════════════════════════════════════
+#  상태 관리 (GitHub Gist)
+# ═══════════════════════════════════════════════════════
+
+def load_state() -> dict:
+    if not GIST_TOKEN or not GIST_ID:
+        print("  [State] Gist 미설정 — 매번 알림")
+        return {}
+    try:
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {"Authorization": f"Bearer {GIST_TOKEN}"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+        content = resp.json()["files"][GIST_FILENAME]["content"]
+        state = json.loads(content)
+        print(f"  [State] 로드: {json.dumps(state, ensure_ascii=False)}")
+        return state
+    except Exception as e:
+        print(f"  [State] 로드 실패: {e}")
+        return {}
+
+
+def save_state(state: dict):
+    if not GIST_TOKEN or not GIST_ID:
+        return
+    try:
+        url = f"https://api.github.com/gists/{GIST_ID}"
+        headers = {
+            "Authorization": f"Bearer {GIST_TOKEN}",
+            "Accept": "application/vnd.github+json",
+        }
+        payload = {"files": {GIST_FILENAME: {"content": json.dumps(state, indent=2)}}}
+        resp = requests.patch(url, json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+        print(f"  [State] 저장 완료")
+    except Exception as e:
+        print(f"  [State] 저장 실패: {e}")
+
+
+def should_alert(state: dict, key: str, current_value: float, now: datetime) -> tuple:
+    """
+    알림 여부 판단
+    Returns: (should_send: bool, reason: str)
+    """
+    if not GIST_TOKEN or not GIST_ID:
+        return True, "첫 알림"
+
+    prev = state.get(key)
+    if prev is None:
+        return True, "첫 알림"
+
+    prev_value = prev["value"]
+    diff = abs(current_value - prev_value)
+
+    if diff >= ALERT_GAP:
+        direction = "악화" if (
+            (key == "usdt_low" and current_value < prev_value) or
+            (key == "gold_low" and current_value < prev_value) or
+            (key == "gold_high" and current_value > prev_value)
+        ) else "변동"
+        return True, f"{direction} ({prev_value:+.2f}% → {current_value:+.2f}%, 차이 {diff:.2f}%p)"
+
+    print(f"  [Gap] {key}: 이전 {prev_value:+.2f}% → 현재 {current_value:+.2f}% (차이 {diff:.2f}%p < {ALERT_GAP}%p) — 알림 생략")
+    return False, ""
+
+
+def update_state(state: dict, key: str, value: float, now: datetime):
+    state[key] = {
+        "value": round(value, 4),
+        "time": now.isoformat(),
+    }
 
 
 # ═══════════════════════════════════════════════════════
@@ -55,7 +131,6 @@ def get_usd_krw_rate() -> float:
         return rate
     except Exception as e:
         print(f"  [FX-1] 실패: {e}")
-
     try:
         resp = requests.get(
             "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/usd.json",
@@ -67,19 +142,13 @@ def get_usd_krw_rate() -> float:
         return rate
     except Exception as e:
         print(f"  [FX-2] 실패: {e}")
-
     raise RuntimeError("USD/KRW 환율을 가져올 수 없습니다.")
 
 
 def get_krx_gold_price_per_gram() -> float:
-    """
-    네이버 증권 내부 API로 KRX 금현물 1g 가격(원) 조회
-    """
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-
-    # 소스 1: 네이버 증권 API (JSON) — 가장 안정적
     try:
         url = "https://api.stock.naver.com/marketindex/metals/M04020000"
         resp = requests.get(url, headers=headers, timeout=15)
@@ -90,28 +159,21 @@ def get_krx_gold_price_per_gram() -> float:
         return price
     except Exception as e:
         print(f"  [KRX Gold] 네이버 API 실패: {e}")
-
-    # 소스 2: 네이버 데스크톱 금시세 페이지 크롤링 (폴백)
     try:
         url = "https://finance.naver.com/marketindex/goldDetail.naver"
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         text = resp.text
-        match = re.search(r"([\d,]+\.\d+)\s*원/g", text)
-        if match:
-            price = float(match.group(1).replace(",", ""))
-            print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g (데스크톱)")
-            return price
-        # 정수 패턴도 시도
-        match = re.search(r"([\d,]+)\s*원/g", text)
-        if match:
-            price = float(match.group(1).replace(",", ""))
-            print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g (데스크톱)")
-            return price
+        for pattern in [r"([\d,]+\.\d+)\s*원/g", r"([\d,]+)\s*원/g"]:
+            match = re.search(pattern, text)
+            if match:
+                price = float(match.group(1).replace(",", ""))
+                print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g (데스크톱)")
+                return price
     except Exception as e:
         print(f"  [KRX Gold] 데스크톱 실패: {e}")
-
     raise RuntimeError("KRX 금현물 가격을 파싱할 수 없습니다.")
+
 
 def get_international_gold_usd_per_oz() -> float:
     ticker = yf.Ticker("GC=F")
@@ -122,7 +184,6 @@ def get_international_gold_usd_per_oz() -> float:
         if hist.empty:
             raise RuntimeError("yfinance에서 금 시세를 가져올 수 없습니다.")
         price = float(hist["Close"].iloc[-1])
-
     print(f"  [Yahoo] 국제 금 = ${price:,.2f}/oz")
     return float(price)
 
@@ -153,31 +214,16 @@ def send_telegram(message: str):
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
     try:
         resp = requests.post(url, json=payload, timeout=10)
-        resp.raise_for_status()
-        print("  [Telegram] 알림 전송 성공")
-    except Exception as e:
-        print(f"  [Telegram] 전송 실패: {e}")
-
-
-def trigger_private_repo(signal_data: dict):
-    if not DISPATCH_PAT or not DISPATCH_REPO:
-        print("  [Dispatch] PAT/REPO 미설정 — dispatch 건너뜀")
-        return
-    url = f"https://api.github.com/repos/{DISPATCH_REPO}/dispatches"
-    headers = {
-        "Authorization": f"Bearer {DISPATCH_PAT}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    payload = {"event_type": "kimp-signal", "client_payload": signal_data}
-    try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
-        if resp.status_code == 204:
-            print(f"  [Dispatch] → {DISPATCH_REPO} 트리거 성공")
+        if resp.ok:
+            print("  [Telegram] 알림 전송 성공")
         else:
-            print(f"  [Dispatch] 실패: {resp.status_code} {resp.text}")
+            try:
+                err = resp.json().get("description", resp.text)
+            except Exception:
+                err = resp.text
+            print(f"  [Telegram] 전송 실패: {resp.status_code} — {err}")
     except Exception as e:
-        print(f"  [Dispatch] 오류: {e}")
+        print(f"  [Telegram] 전송 오류: {e}")
 
 
 # ═══════════════════════════════════════════════════════
@@ -188,10 +234,14 @@ def main():
     now = datetime.now(KST)
     print(f"\n{'='*55}")
     print(f"  김치프리미엄 모니터  |  {now.strftime('%Y-%m-%d %H:%M:%S KST')}")
+    print(f"  재알림 기준: 이전 대비 ±{ALERT_GAP}%p 이상 변동 시")
     print(f"{'='*55}")
 
+    # 상태 로드
+    print("\n[0] 알림 상태 로드")
+    state = load_state()
+    state_updated = False
     alerts = []
-    signal_data = {}
 
     # 1. USD/KRW
     print("\n[1] USD/KRW 환율 조회")
@@ -212,21 +262,24 @@ def main():
         print(f"  ▶ 테더 김프 = {usdt_kimp:+.2f}%")
 
         if usdt_kimp <= USDT_KIMP_LOW:
-            emoji = "🔵" if usdt_kimp < 0 else "🟡"
-            alert_msg = (
-                f"{emoji} <b>테더 김프 알림</b>\n"
-                f"김프: <b>{usdt_kimp:+.2f}%</b> (기준: ≤{USDT_KIMP_LOW}%)\n"
-                f"Upbit USDT: {upbit_usdt:,.0f}원\n"
-                f"환율(USD/KRW): {usd_krw:,.2f}원\n"
-                f"차이: {upbit_usdt - usd_krw:+,.2f}원\n"
-                f"⏰ {now.strftime('%H:%M KST')}"
-            )
-            alerts.append(alert_msg)
-            signal_data["usdt"] = {
-                "kimp": round(usdt_kimp, 4),
-                "upbit_price": upbit_usdt,
-                "usd_krw": usd_krw,
-            }
+            send_it, reason = should_alert(state, "usdt_low", usdt_kimp, now)
+            if send_it:
+                emoji = "🔵" if usdt_kimp < 0 else "🟡"
+                alert_msg = (
+                    f"{emoji} <b>테더 김프 알림</b> ({reason})\n"
+                    f"김프: <b>{usdt_kimp:+.2f}%</b> (기준: ≤{USDT_KIMP_LOW}%)\n"
+                    f"Upbit USDT: {upbit_usdt:,.0f}원\n"
+                    f"환율: {usd_krw:,.2f}원\n"
+                    f"⏰ {now.strftime('%H:%M KST')}"
+                )
+                alerts.append(alert_msg)
+                update_state(state, "usdt_low", usdt_kimp, now)
+                state_updated = True
+        else:
+            if "usdt_low" in state:
+                del state["usdt_low"]
+                state_updated = True
+                print("  [State] 테더 정상 복귀 → 상태 초기화")
     except Exception as e:
         print(f"  ⚠ 테더 김프 계산 실패: {e}")
 
@@ -241,41 +294,57 @@ def main():
         print(f"  ▶ 금 김프 = {gold_kimp:+.2f}%")
         print(f"    국내: {krx_gold:,.0f}원/g | 국제: {intl_gold_krw_g:,.0f}원/g")
 
-        # ⚡ 이중 트리거: 0% 이하 OR 10% 이상
-        gold_triggered = False
-        trigger_reason = ""
-
         if gold_kimp <= GOLD_KIMP_LOW:
-            gold_triggered = True
-            trigger_reason = f"≤ {GOLD_KIMP_LOW}%"
-            emoji = "🔵"
-        elif gold_kimp >= GOLD_KIMP_HIGH:
-            gold_triggered = True
-            trigger_reason = f"≥ {GOLD_KIMP_HIGH}%"
-            emoji = "🔴"
+            send_it, reason = should_alert(state, "gold_low", gold_kimp, now)
+            if send_it:
+                alert_msg = (
+                    f"🔵 <b>금 김프 알림</b> (≤{GOLD_KIMP_LOW}%, {reason})\n"
+                    f"김프: <b>{gold_kimp:+.2f}%</b>\n"
+                    f"국내: {krx_gold:,.0f}원/g\n"
+                    f"국제: {intl_gold_krw_g:,.0f}원/g (${intl_gold_oz:,.2f}/oz)\n"
+                    f"환율: {usd_krw:,.2f}원\n"
+                    f"⏰ {now.strftime('%H:%M KST')}"
+                )
+                alerts.append(alert_msg)
+                update_state(state, "gold_low", gold_kimp, now)
+                state_updated = True
+            if "gold_high" in state:
+                del state["gold_high"]
+                state_updated = True
 
-        if gold_triggered:
-            alert_msg = (
-                f"{emoji} <b>금 김프 알림</b> ({trigger_reason})\n"
-                f"김프: <b>{gold_kimp:+.2f}%</b>\n"
-                f"국내(KRX): {krx_gold:,.0f}원/g\n"
-                f"국제: {intl_gold_krw_g:,.0f}원/g (${intl_gold_oz:,.2f}/oz)\n"
-                f"환율(USD/KRW): {usd_krw:,.2f}원\n"
-                f"⏰ {now.strftime('%H:%M KST')}"
-            )
-            alerts.append(alert_msg)
-            signal_data["gold"] = {
-                "kimp": round(gold_kimp, 4),
-                "krx_gold_krw_g": krx_gold,
-                "intl_gold_usd_oz": intl_gold_oz,
-                "intl_gold_krw_g": round(intl_gold_krw_g, 2),
-                "usd_krw": usd_krw,
-                "trigger": trigger_reason,
-            }
+        elif gold_kimp >= GOLD_KIMP_HIGH:
+            send_it, reason = should_alert(state, "gold_high", gold_kimp, now)
+            if send_it:
+                alert_msg = (
+                    f"🔴 <b>금 김프 알림</b> (≥{GOLD_KIMP_HIGH}%, {reason})\n"
+                    f"김프: <b>{gold_kimp:+.2f}%</b>\n"
+                    f"국내: {krx_gold:,.0f}원/g\n"
+                    f"국제: {intl_gold_krw_g:,.0f}원/g (${intl_gold_oz:,.2f}/oz)\n"
+                    f"환율: {usd_krw:,.2f}원\n"
+                    f"⏰ {now.strftime('%H:%M KST')}"
+                )
+                alerts.append(alert_msg)
+                update_state(state, "gold_high", gold_kimp, now)
+                state_updated = True
+            if "gold_low" in state:
+                del state["gold_low"]
+                state_updated = True
+
+        else:
+            changed = False
+            if "gold_low" in state:
+                del state["gold_low"]
+                changed = True
+            if "gold_high" in state:
+                del state["gold_high"]
+                changed = True
+            if changed:
+                state_updated = True
+                print("  [State] 금 김프 정상 복귀 → 상태 초기화")
     except Exception as e:
         print(f"  ⚠ 금 김프 계산 실패: {e}")
 
-    # 4. 결과 요약
+    # 4. 결과
     print(f"\n{'─'*55}")
     usdt_str = f"{usdt_kimp:+.2f}%" if usdt_kimp is not None else "N/A"
     gold_str = f"{gold_kimp:+.2f}%" if gold_kimp is not None else "N/A"
@@ -285,10 +354,12 @@ def main():
     if alerts:
         print(f"\n  🚨 알림 {len(alerts)}건 발송!")
         send_telegram("\n\n".join(alerts))
-        if signal_data:
-            trigger_private_repo(signal_data)
     else:
-        print("\n  ✅ 정상 범위 — 알림 없음")
+        print("\n  ✅ 알림 없음 (정상 범위 또는 변동폭 미달)")
+
+    if state_updated:
+        print("\n[5] 상태 저장")
+        save_state(state)
 
     print(f"{'='*55}\n")
 
