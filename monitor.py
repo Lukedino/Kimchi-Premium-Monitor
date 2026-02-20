@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 김치프리미엄 모니터 — 테더 김프 & 금 김프
-스마트 알림: 최초 알림 후 급변(gap) 시에만 재알림
+스마트 알림: 방향성 기반 — 악화 시에만 재알림
+상태 저장: 레포 내 state.json (최근 10건 이력 + 마지막 알림값)
 """
 
 import os
@@ -16,6 +17,8 @@ import yfinance as yf
 # ─── 상수 ───────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))
 TROY_OUNCE_TO_GRAM = 31.1035
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
+MAX_HISTORY = 10
 
 # ─── 환경변수 ───────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
@@ -26,78 +29,94 @@ USDT_KIMP_HIGH = float(os.environ.get("USDT_KIMP_HIGH") or "10")
 GOLD_KIMP_LOW = float(os.environ.get("GOLD_KIMP_LOW") or "0")
 GOLD_KIMP_HIGH = float(os.environ.get("GOLD_KIMP_HIGH") or "10")
 
-# 재알림 기준: 이전 알림값 대비 이만큼 변하면 재알림 (%p 단위)
-ALERT_GAP = float(os.environ.get("ALERT_GAP") or "0.5")
-
-# Gist 상태 저장
-GIST_TOKEN = os.environ.get("GIST_TOKEN") or ""
-GIST_ID = os.environ.get("GIST_ID") or ""
-GIST_FILENAME = "kimp_alert_state.json"
-
 
 # ═══════════════════════════════════════════════════════
-#  상태 관리 (GitHub Gist)
+#  상태 관리 (로컬 파일 + git commit)
 # ═══════════════════════════════════════════════════════
 
 def load_state() -> dict:
-    if not GIST_TOKEN or not GIST_ID:
-        print("  [State] Gist 미설정 — 매번 알림")
-        return {}
     try:
-        url = f"https://api.github.com/gists/{GIST_ID}"
-        headers = {"Authorization": f"Bearer {GIST_TOKEN}"}
-        resp = requests.get(url, headers=headers, timeout=10)
-        resp.raise_for_status()
-        content = resp.json()["files"][GIST_FILENAME]["content"]
-        state = json.loads(content)
-        print(f"  [State] 로드: {json.dumps(state, ensure_ascii=False)}")
-        return state
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            history_count = len(state.get("history", []))
+            alert_keys = list(state.get("last_alert", {}).keys())
+            print(f"  [State] 로드 성공: 이력 {history_count}건, 알림상태 {alert_keys}")
+            return state
     except Exception as e:
         print(f"  [State] 로드 실패: {e}")
-        return {}
+    print("  [State] 신규 생성")
+    return {"history": [], "last_alert": {}}
 
 
 def save_state(state: dict):
-    if not GIST_TOKEN or not GIST_ID:
-        return
     try:
-        url = f"https://api.github.com/gists/{GIST_ID}"
-        headers = {
-            "Authorization": f"Bearer {GIST_TOKEN}",
-            "Accept": "application/vnd.github+json",
-        }
-        payload = {"files": {GIST_FILENAME: {"content": json.dumps(state, indent=2)}}}
-        resp = requests.patch(url, json=payload, headers=headers, timeout=10)
-        resp.raise_for_status()
-        print(f"  [State] 저장 완료")
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        print(f"  [State] 파일 저장 완료")
+
+        os.system("git config user.name 'kimp-bot'")
+        os.system("git config user.email 'bot@kimp-monitor'")
+        os.system(f"git add {STATE_FILE}")
+
+        result = os.popen("git diff --cached --quiet; echo $?").read().strip()
+        if result == "1":
+            os.system('git commit -m "update state [skip ci]"')
+            os.system("git push")
+            print("  [State] git push 완료")
+        else:
+            print("  [State] 변경사항 없음 — push 생략")
     except Exception as e:
         print(f"  [State] 저장 실패: {e}")
 
 
-def should_alert(state: dict, key: str, current_value: float, now: datetime) -> tuple:
-    if not GIST_TOKEN or not GIST_ID:
-        return True, "첫 알림"
+def add_history(state: dict, usdt_kimp, gold_kimp, now: datetime):
+    entry = {
+        "time": now.isoformat(),
+        "usdt_kimp": round(usdt_kimp, 4) if usdt_kimp is not None else None,
+        "gold_kimp": round(gold_kimp, 4) if gold_kimp is not None else None,
+    }
+    state.setdefault("history", []).append(entry)
+    if len(state["history"]) > MAX_HISTORY:
+        state["history"] = state["history"][-MAX_HISTORY:]
 
-    prev = state.get(key)
+
+def should_alert(state: dict, key: str, current_value: float, now: datetime) -> tuple:
+    """
+    방향성 기반 알림 판단
+    - 첫 알림: 무조건 발송
+    - 재알림: 이전보다 더 악화(같은 방향으로 심화)될 때만
+      - _low 키: 현재값이 이전값보다 더 낮을 때
+      - _high 키: 현재값이 이전값보다 더 높을 때
+    """
+    last_alert = state.get("last_alert", {})
+    prev = last_alert.get(key)
+
     if prev is None:
         return True, "첫 알림"
 
     prev_value = prev["value"]
-    diff = abs(current_value - prev_value)
+    diff = current_value - prev_value
 
-    if diff >= ALERT_GAP:
-        direction = "악화" if (
-            (key.endswith("_low") and current_value < prev_value) or
-            (key.endswith("_high") and current_value > prev_value)
-        ) else "변동"
-        return True, f"{direction} ({prev_value:+.2f}% → {current_value:+.2f}%, 차이 {diff:.2f}%p)"
+    if key.endswith("_low"):
+        if current_value < prev_value:
+            return True, f"악화 ({prev_value:+.2f}% → {current_value:+.2f}%, {diff:+.2f}%p)"
+        else:
+            print(f"  [Filter] {key}: 이전 {prev_value:+.2f}% → 현재 {current_value:+.2f}% (개선 방향) — 알림 생략")
+            return False, ""
 
-    print(f"  [Gap] {key}: 이전 {prev_value:+.2f}% → 현재 {current_value:+.2f}% (차이 {diff:.2f}%p < {ALERT_GAP}%p) — 알림 생략")
-    return False, ""
+    if key.endswith("_high"):
+        if current_value > prev_value:
+            return True, f"악화 ({prev_value:+.2f}% → {current_value:+.2f}%, {diff:+.2f}%p)"
+        else:
+            print(f"  [Filter] {key}: 이전 {prev_value:+.2f}% → 현재 {current_value:+.2f}% (개선 방향) — 알림 생략")
+            return False, ""
+
+    return True, "알림"
 
 
 def update_state(state: dict, key: str, value: float, now: datetime):
-    state[key] = {
+    state.setdefault("last_alert", {})[key] = {
         "value": round(value, 4),
         "time": now.isoformat(),
     }
@@ -172,7 +191,6 @@ def get_krx_gold_price_per_gram() -> float:
 
 
 def get_international_gold_usd_per_oz() -> float:
-    # 소스 1: Swissquote — XAU/USD 현물 (무료, 키 불필요)
     try:
         url = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
         resp = requests.get(url, timeout=10)
@@ -187,7 +205,6 @@ def get_international_gold_usd_per_oz() -> float:
     except Exception as e:
         print(f"  [Swissquote] 실패: {e}")
 
-    # 소스 2: yfinance GC=F (선물, 폴백)
     try:
         print("  [Yahoo] 폴백: 선물(GC=F) 사용")
         ticker = yf.Ticker("GC=F")
@@ -252,13 +269,12 @@ def main():
     now = datetime.now(KST)
     print(f"\n{'='*55}")
     print(f"  김치프리미엄 모니터  |  {now.strftime('%Y-%m-%d %H:%M:%S KST')}")
-    print(f"  재알림 기준: 이전 대비 ±{ALERT_GAP}%p 이상 변동 시")
+    print(f"  알림 방식: 방향성 기반 (악화 시에만 재알림)")
     print(f"{'='*55}")
 
     # 상태 로드
     print("\n[0] 알림 상태 로드")
     state = load_state()
-    state_updated = False
     alerts = []
 
     # 1. USD/KRW
@@ -292,10 +308,8 @@ def main():
                 )
                 alerts.append(alert_msg)
                 update_state(state, "usdt_low", usdt_kimp, now)
-                state_updated = True
-            if "usdt_high" in state:
-                del state["usdt_high"]
-                state_updated = True
+            if "usdt_high" in state.get("last_alert", {}):
+                del state["last_alert"]["usdt_high"]
 
         elif usdt_kimp >= USDT_KIMP_HIGH:
             send_it, reason = should_alert(state, "usdt_high", usdt_kimp, now)
@@ -309,21 +323,14 @@ def main():
                 )
                 alerts.append(alert_msg)
                 update_state(state, "usdt_high", usdt_kimp, now)
-                state_updated = True
-            if "usdt_low" in state:
-                del state["usdt_low"]
-                state_updated = True
+            if "usdt_low" in state.get("last_alert", {}):
+                del state["last_alert"]["usdt_low"]
 
         else:
-            changed = False
-            if "usdt_low" in state:
-                del state["usdt_low"]
-                changed = True
-            if "usdt_high" in state:
-                del state["usdt_high"]
-                changed = True
-            if changed:
-                state_updated = True
+            la = state.get("last_alert", {})
+            if "usdt_low" in la or "usdt_high" in la:
+                la.pop("usdt_low", None)
+                la.pop("usdt_high", None)
                 print("  [State] 테더 정상 복귀 → 상태 초기화")
     except Exception as e:
         print(f"  ⚠ 테더 김프 계산 실패: {e}")
@@ -352,10 +359,8 @@ def main():
                 )
                 alerts.append(alert_msg)
                 update_state(state, "gold_low", gold_kimp, now)
-                state_updated = True
-            if "gold_high" in state:
-                del state["gold_high"]
-                state_updated = True
+            if "gold_high" in state.get("last_alert", {}):
+                del state["last_alert"]["gold_high"]
 
         elif gold_kimp >= GOLD_KIMP_HIGH:
             send_it, reason = should_alert(state, "gold_high", gold_kimp, now)
@@ -370,24 +375,20 @@ def main():
                 )
                 alerts.append(alert_msg)
                 update_state(state, "gold_high", gold_kimp, now)
-                state_updated = True
-            if "gold_low" in state:
-                del state["gold_low"]
-                state_updated = True
+            if "gold_low" in state.get("last_alert", {}):
+                del state["last_alert"]["gold_low"]
 
         else:
-            changed = False
-            if "gold_low" in state:
-                del state["gold_low"]
-                changed = True
-            if "gold_high" in state:
-                del state["gold_high"]
-                changed = True
-            if changed:
-                state_updated = True
+            la = state.get("last_alert", {})
+            if "gold_low" in la or "gold_high" in la:
+                la.pop("gold_low", None)
+                la.pop("gold_high", None)
                 print("  [State] 금 김프 정상 복귀 → 상태 초기화")
     except Exception as e:
         print(f"  ⚠ 금 김프 계산 실패: {e}")
+
+    # 이력 기록
+    add_history(state, usdt_kimp, gold_kimp, now)
 
     # 4. 결과
     print(f"\n{'─'*55}")
@@ -396,7 +397,6 @@ def main():
     print(f"  요약: 테더 김프={usdt_str} | 금 김프={gold_str}")
     print(f"  조건: 테더 ≤{USDT_KIMP_LOW}% 또는 ≥{USDT_KIMP_HIGH}% | 금 ≤{GOLD_KIMP_LOW}% 또는 ≥{GOLD_KIMP_HIGH}%")
 
-    # 수동 실행 시 항상 현재 상태 리포트 전송
     run_mode = os.environ.get("RUN_MODE") or ""
     is_manual = run_mode == "workflow_dispatch"
     print(f"  실행 모드: {'수동' if is_manual else '스케줄'} (RUN_MODE={run_mode})")
@@ -424,11 +424,11 @@ def main():
         print(f"\n  🚨 알림 {len(alerts)}건 발송!")
         send_telegram("\n\n".join(alerts))
     else:
-        print("\n  ✅ 알림 없음 (정상 범위 또는 변동폭 미달)")
+        print("\n  ✅ 알림 없음 (정상 범위 또는 개선 방향)")
 
-    if state_updated:
-        print("\n[5] 상태 저장")
-        save_state(state)
+    # 상태 저장 (매 실행마다)
+    print("\n[5] 상태 저장")
+    save_state(state)
 
     print(f"{'='*55}\n")
 
