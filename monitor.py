@@ -383,7 +383,8 @@ def main():
     # 수동 실행 시 항상 현재 상태 리포트 전송
     run_mode = os.environ.get("RUN_MODE") or ""
     is_manual = run_mode == "workflow_dispatch"
-
+    print(f"  실행 모드: {'수동' if is_manual else '스케줄'} (RUN_MODE={run_mode})")
+    
     if is_manual and not alerts:
         report = (
             f"📊 <b>김프 현황 리포트</b> (수동 조회)\n\n"
