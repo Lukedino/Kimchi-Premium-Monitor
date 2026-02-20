@@ -24,11 +24,13 @@ jobs:
 
       - name: Run monitor
         env:
+          RUN_MODE: ${{ github.event_name }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DISPATCH_PAT: ${{ secrets.DISPATCH_PAT }}
-          DISPATCH_REPO: ${{ vars.DISPATCH_REPO }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
           USDT_KIMP_LOW: ${{ vars.USDT_KIMP_LOW }}
           GOLD_KIMP_LOW: ${{ vars.GOLD_KIMP_LOW }}
           GOLD_KIMP_HIGH: ${{ vars.GOLD_KIMP_HIGH }}
+          ALERT_GAP: ${{ vars.ALERT_GAP }}
         run: python monitor.py
