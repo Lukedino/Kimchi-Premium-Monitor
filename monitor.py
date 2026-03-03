@@ -22,8 +22,9 @@ STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.jso
 MAX_HISTORY = 10
 
 # 금값 합리적 범위 (USD/oz) — 이 범위를 벗어나면 비정상값으로 간주
+# ✅ 수정: 상한선 5_000 → 10_000 (현재 금값 $5,200대, JP모건 목표가 $6,300 감안)
 GOLD_PRICE_MIN_USD = 1_000
-GOLD_PRICE_MAX_USD = 5_000
+GOLD_PRICE_MAX_USD = 10_000
 
 # ─── 환경변수 ───────────────────────────────────────────
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
@@ -170,9 +171,9 @@ def get_usd_krw_rate() -> float:
         data = resp.json()
 
         if data.get("isSuccess") and data.get("result"):
-            item       = data["result"][0]
-            traded_at  = item.get("localTradedAt", "")
-            rate       = float(item["closePrice"].replace(",", ""))
+            item      = data["result"][0]
+            traded_at = item.get("localTradedAt", "")
+            rate      = float(item["closePrice"].replace(",", ""))
 
             if traded_at == today_kst:
                 print(f"  [Naver] USD/KRW = {rate:,.2f}  (당일 {traded_at})")
@@ -259,33 +260,13 @@ def get_krx_gold_price_per_gram() -> float:
 def get_international_gold_usd_per_oz() -> float:
     """
     국제 금 현물 시세 (USD/oz) — 다중 소스 폴백 + 비정상값 검증
-    1순위: 야후 파이낸스 GC=F  (Swissquote가 비정상값 반환 중이므로 순위 변경)
-    2순위: Swissquote API      (값 범위 검증 포함)
+    ✅ 수정: Swissquote를 1순위로 원복, Yahoo GC=F를 2순위 폴백으로 변경
+           (이전에 Swissquote가 비정상값이라 판단했으나, 실제로는 금값이
+            $5,200대까지 상승한 것이었음 — 범위 상수 오류였음)
     """
 
-    # 1순위 — 야후 파이낸스 금 선물
+    # 1순위 — Swissquote API (현물 bid/ask 중간값)
     try:
-        print("  [Yahoo] GC=F 금 선물 시도...")
-        ticker = yf.Ticker("GC=F")
-        try:
-            price = float(ticker.fast_info.last_price)
-        except Exception:
-            hist = ticker.history(period="1d")
-            if hist.empty:
-                raise RuntimeError("yfinance 히스토리 데이터 없음")
-            price = float(hist["Close"].iloc[-1])
-
-        if not (GOLD_PRICE_MIN_USD < price < GOLD_PRICE_MAX_USD):
-            raise ValueError(f"비정상 금값 감지: ${price:,.2f}/oz")
-
-        print(f"  [Yahoo] 국제 금 선물 = ${price:,.2f}/oz")
-        return price
-    except Exception as e:
-        print(f"  [Yahoo] 금 선물 실패: {e}")
-
-    # 2순위 — Swissquote API (범위 검증 포함)
-    try:
-        print("  [Swissquote] 폴백 시도...")
         url  = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
         resp = requests.get(url, timeout=10)
         resp.raise_for_status()
@@ -305,6 +286,26 @@ def get_international_gold_usd_per_oz() -> float:
         return spot
     except Exception as e:
         print(f"  [Swissquote] 실패: {e}")
+
+    # 2순위 — 야후 파이낸스 금 선물 (폴백)
+    try:
+        print("  [Yahoo] 폴백: GC=F 금 선물 시도...")
+        ticker = yf.Ticker("GC=F")
+        try:
+            price = float(ticker.fast_info.last_price)
+        except Exception:
+            hist = ticker.history(period="1d")
+            if hist.empty:
+                raise RuntimeError("yfinance 히스토리 데이터 없음")
+            price = float(hist["Close"].iloc[-1])
+
+        if not (GOLD_PRICE_MIN_USD < price < GOLD_PRICE_MAX_USD):
+            raise ValueError(f"비정상 금값 감지: ${price:,.2f}/oz")
+
+        print(f"  [Yahoo] 국제 금 선물 = ${price:,.2f}/oz")
+        return price
+    except Exception as e:
+        print(f"  [Yahoo] 금 선물 실패: {e}")
 
     raise RuntimeError("국제 금 시세를 가져올 수 없습니다.")
 
@@ -431,13 +432,13 @@ def main():
 
     # ── 3. 금 김프 ──────────────────────────────────────
     print("\n[3] 금 김프 계산")
-    gold_kimp      = None
-    krx_gold       = None
-    intl_gold_oz   = None
+    gold_kimp       = None
+    krx_gold        = None
+    intl_gold_oz    = None
     intl_gold_krw_g = None
     try:
-        krx_gold        = get_krx_gold_price_per_gram()
-        intl_gold_oz    = get_international_gold_usd_per_oz()
+        krx_gold                   = get_krx_gold_price_per_gram()
+        intl_gold_oz               = get_international_gold_usd_per_oz()
         gold_kimp, intl_gold_krw_g = calc_gold_kimp(krx_gold, intl_gold_oz, usd_krw)
 
         print(f"  ▶ 금 김프 = {gold_kimp:+.2f}%")
