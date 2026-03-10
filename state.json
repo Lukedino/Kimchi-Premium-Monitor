@@ -1,14 +1,6 @@
 {
   "history": [
     {
-      "time": "2026-03-10T18:00:47.942893+09:00",
-      "usdt_kimp": -0.8007,
-      "gold_kimp": -1.1576,
-      "usd_krw": 1473.8,
-      "intl_gold_usd_oz": 5182.21,
-      "krx_gold_krw_g": 242710.0
-    },
-    {
       "time": "2026-03-10T19:00:36.297901+09:00",
       "usdt_kimp": -0.6047,
       "gold_kimp": -1.0197,
@@ -78,6 +70,14 @@
       "gold_kimp": -1.4416,
       "usd_krw": 1465.8,
       "intl_gold_usd_oz": 5225.51,
+      "krx_gold_krw_g": 242710.0
+    },
+    {
+      "time": "2026-03-11T04:08:37.020423+09:00",
+      "usdt_kimp": -0.5375,
+      "gold_kimp": -1.2002,
+      "usd_krw": 1469.9,
+      "intl_gold_usd_oz": 5198.2,
       "krx_gold_krw_g": 242710.0
     }
   ],
