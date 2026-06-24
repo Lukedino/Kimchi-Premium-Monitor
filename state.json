@@ -1,14 +1,6 @@
 {
   "history": [
     {
-      "time": "2026-06-23T20:31:04.475331+09:00",
-      "usdt_kimp": -1.7375,
-      "gold_kimp": -0.5554,
-      "usd_krw": 1536.7,
-      "intl_gold_usd_oz": 4126.26,
-      "krx_gold_krw_g": 202730.0
-    },
-    {
       "time": "2026-06-23T23:05:01.433266+09:00",
       "usdt_kimp": -1.6799,
       "gold_kimp": -0.7654,
@@ -79,20 +71,20 @@
       "usd_krw": 1548.1,
       "intl_gold_usd_oz": 4071.51,
       "krx_gold_krw_g": 201600.0
+    },
+    {
+      "time": "2026-06-24T21:07:04.925344+09:00",
+      "usdt_kimp": -2.2182,
+      "gold_kimp": 0.3359,
+      "usd_krw": 1546.3,
+      "intl_gold_usd_oz": 4041.57,
+      "krx_gold_krw_g": 201600.0
     }
   ],
   "last_alert": {
     "usdt_low": {
       "value": -3.6573,
       "time": "2026-06-02T13:51:29.639906+09:00"
-    },
-    "gold_low": {
-      "value": -0.4203,
-      "time": "2026-06-24T10:31:34.251881+09:00",
-      "step_level": 0,
-      "usd_krw": 1535.4,
-      "intl_gold_usd_oz": 4094.86,
-      "krx_gold_krw_g": 201290.0
     }
   }
 }
