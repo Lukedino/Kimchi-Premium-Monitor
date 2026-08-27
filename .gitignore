@@ -205,3 +205,10 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# 2026-08-27 보안점검: 자격증명 패턴 + Claude Code 로컬 설정 + SDD 산출물
+credentials*.json
+token*.json
+*service*account*.json
+.claude/settings.local.json
+.superpowers/

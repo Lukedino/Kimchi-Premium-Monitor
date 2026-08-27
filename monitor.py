@@ -579,7 +579,8 @@ def send_telegram(message: str):
                 err = resp.text
             print(f"  [Telegram] 전송 실패: {resp.status_code} — {err}")
     except Exception as e:
-        print(f"  [Telegram] 전송 오류: {e}")
+        # 예외 문자열에 요청 URL(봇 토큰 포함)이 실릴 수 있어 타입만 남긴다 (2026-08-27 보안점검)
+        print(f"  [Telegram] 전송 오류: {type(e).__name__}")
 
 
 # ═══════════════════════════════════════════════════════
