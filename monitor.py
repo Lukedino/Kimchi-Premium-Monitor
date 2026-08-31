@@ -67,15 +67,18 @@ def save_state(state: dict):
             json.dump(state, f, indent=2, ensure_ascii=False)
         print("  [State] 파일 저장 완료")
 
-        os.system("git config user.name 'kimp-bot'")
-        os.system("git config user.email 'bot@kimp-monitor'")
-        os.system(f"git add {STATE_FILE}")
-
-        result = os.popen("git diff --cached --quiet; echo $?").read().strip()
-        if result == "1":
-            os.system('git commit -m "update state [skip ci]"')
-            os.system("git push")
-            print("  [State] git push 완료")
+        # 2026-08-31 보안점검 ⑦: os.system 문자열 조합 → subprocess 리스트 인자
+        # (인젝션 여지 제거 + 공백 포함 경로에서도 동작. os.popen 의 "echo $?" 는 Windows 셸에서 깨졌음)
+        import subprocess
+        def _git(*args):
+            return subprocess.run(["git", *args], capture_output=True, text=True)
+        _git("config", "user.name", "kimp-bot")
+        _git("config", "user.email", "bot@kimp-monitor")
+        _git("add", str(STATE_FILE))
+        if _git("diff", "--cached", "--quiet").returncode == 1:
+            _git("commit", "-m", "update state [skip ci]")
+            push = _git("push")
+            print("  [State] git push 완료" if push.returncode == 0 else f"  [State] git push 실패 (rc={push.returncode})")
         else:
             print("  [State] 변경사항 없음 — push 생략")
     except Exception as e:
