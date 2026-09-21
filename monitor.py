@@ -12,10 +12,10 @@ import sys
 import json
 import re
 import math
+import argparse
+import subprocess
+import tempfile
 from datetime import datetime, timezone, timedelta
-
-import requests
-import yfinance as yf
 
 # ─── 상수 ───────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))
@@ -33,60 +33,179 @@ GOLD_PRICE_MAX_USD = 10_000
 GOLD_KIMP_STEP = 1.0  # 단계 간격 (1%p 단위)
 
 # ─── 환경변수 ───────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")   or ""
+# Importing this module does not read credentials or load network clients.
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID = ""
+USDT_KIMP_LOW = GOLD_KIMP_LOW = 0.0
+USDT_KIMP_HIGH = GOLD_KIMP_HIGH = 10.0
+SOURCE_FAILURE_ALERT_AFTER = 3
 
-USDT_KIMP_LOW  = float(os.environ.get("USDT_KIMP_LOW")  or "0")
-USDT_KIMP_HIGH = float(os.environ.get("USDT_KIMP_HIGH") or "10")
-GOLD_KIMP_LOW  = float(os.environ.get("GOLD_KIMP_LOW")  or "0")
-GOLD_KIMP_HIGH = float(os.environ.get("GOLD_KIMP_HIGH") or "10")
+
+def valid_number(value, label: str, *, positive=False) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label}: boolean is not a price or threshold")
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(f"{label}: numeric value required") from None
+    if not math.isfinite(number) or (positive and number <= 0):
+        raise ValueError(f"{label}: finite{' positive' if positive else ''} value required")
+    return number
+
+
+def configure(environ):
+    values = {
+        name: valid_number(environ.get(name) or default, name)
+        for name, default in (
+            ("USDT_KIMP_LOW", "0"), ("USDT_KIMP_HIGH", "10"),
+            ("GOLD_KIMP_LOW", "0"), ("GOLD_KIMP_HIGH", "10"),
+        )
+    }
+    for asset in ("USDT", "GOLD"):
+        if values[f"{asset}_KIMP_LOW"] >= values[f"{asset}_KIMP_HIGH"]:
+            raise ValueError(f"{asset}: LOW must be less than HIGH")
+    globals().update(values)
+    globals()["TELEGRAM_BOT_TOKEN"] = environ.get("TELEGRAM_BOT_TOKEN") or ""
+    globals()["TELEGRAM_CHAT_ID"] = environ.get("TELEGRAM_CHAT_ID") or ""
+
+
+def _requests():
+    import requests
+    return requests
+
+
+def _ticker(symbol):
+    import yfinance
+    return yfinance.Ticker(symbol)
 
 
 # ═══════════════════════════════════════════════════════
 #  상태 관리
 # ═══════════════════════════════════════════════════════
 
-def load_state() -> dict:
-    try:
-        if os.path.exists(STATE_FILE):
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            history_count = len(state.get("history", []))
-            alert_keys    = list(state.get("last_alert", {}).keys())
-            print(f"  [State] 로드 성공: 이력 {history_count}건, 알림상태 {alert_keys}")
-            return state
-    except Exception as e:
-        print(f"  [State] 로드 실패: {e}")
-    print("  [State] 신규 생성")
-    return {"history": [], "last_alert": {}}
+class StateError(RuntimeError):
+    """State could not be loaded, persisted, or published safely."""
 
 
-def save_state(state: dict):
+def validate_state(state: dict):
+    if not isinstance(state, dict):
+        raise ValueError("state must be an object")
+    if not isinstance(state.get("history"), list) or not isinstance(state.get("last_alert"), dict):
+        raise ValueError("history/list and last_alert/object are required")
+    json.dumps(state, allow_nan=False)
+    for entry in [*state["history"], *state["last_alert"].values()]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("time"), str):
+            raise ValueError("state entry requires a timestamp")
+        datetime.fromisoformat(entry["time"])
+        for name in ("value", "usdt_kimp", "gold_kimp", "usd_krw", "intl_gold_usd_oz", "krx_gold_krw_g"):
+            value = entry.get(name)
+            if value is not None:
+                if not isinstance(value, (int, float)) or isinstance(value, bool):
+                    raise ValueError("state measurements must be JSON numbers")
+                valid_number(value, name, positive=name in ("usd_krw", "intl_gold_usd_oz", "krx_gold_krw_g"))
+    for key, entry in state["last_alert"].items():
+        if key not in ("usdt_low", "usdt_high", "gold_low", "gold_high") or entry.get("value") is None:
+            raise ValueError("invalid alert entry")
+        if "step_level" in entry and (type(entry["step_level"]) is not int or entry["step_level"] < 0):
+            raise ValueError("invalid alert step level")
+    health = state.get("health", {})
+    if not isinstance(health, dict):
+        raise ValueError("health must be an object")
+    for entry in health.values():
+        if not isinstance(entry, dict) or entry.get("status") not in ("ok", "error"):
+            raise ValueError("invalid source health")
+        if type(entry.get("consecutive_failures")) is not int or entry["consecutive_failures"] < 0:
+            raise ValueError("invalid failure counter")
+        for name in ("last_success", "last_failure", "first_failure", "last_warning"):
+            if name in entry:
+                datetime.fromisoformat(entry[name])
+
+
+def load_state(state_file=None) -> dict:
+    path = state_file or STATE_FILE
     try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2, ensure_ascii=False)
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        validate_state(state)
+    except FileNotFoundError:
+        print("  [State] 신규 생성")
+        return {"history": [], "last_alert": {}}
+    except (OSError, ValueError, TypeError, OverflowError) as e:
+        raise StateError(f"load failed ({type(e).__name__}); existing file preserved") from None
+    print(f"  [State] 로드 성공: 이력 {len(state['history'])}건")
+    return state
+
+
+def publish_state(state_file):
+    directory = os.path.dirname(os.path.abspath(__file__))
+    if os.path.abspath(state_file) != os.path.join(directory, "state.json"):
+        raise StateError("only the repository state.json can be published")
+
+    def git(*args, allowed=(0,)):
+        operation = "commit" if "commit" in args else args[0]
+        try:
+            result = subprocess.run(
+                ["git", *args], cwd=directory, capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise StateError(f"git {operation} failed ({type(e).__name__})") from None
+        if result.returncode not in allowed:
+            raise StateError(f"git {operation} failed (rc={result.returncode})")
+        return result.returncode
+
+    git("add", "--", "state.json")
+    changed = git("diff", "--cached", "--quiet", "--", "state.json", allowed=(0, 1))
+    if changed == 0:
+        print("  [State] 변경사항 없음 — push 생략")
+        return
+    git("-c", "user.name=kimp-bot", "-c", "user.email=bot@kimp-monitor",
+        "commit", "--only", "-m", "update state [skip ci]", "--", "state.json")
+    # Retry the same push once; never fetch/rebase/force over competing state.
+    for attempt in range(2):
+        try:
+            git("push")
+            print("  [State] git push 완료")
+            return
+        except StateError:
+            if attempt == 1:
+                raise
+            print("  [State] push 실패 — 동일 커밋 1회 재시도")
+
+
+def save_state(state: dict, *, publish=False, state_file=None):
+    path = os.path.abspath(state_file or STATE_FILE)
+    temporary = None
+    try:
+        validate_state(state)
+        payload = json.dumps(state, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                                         prefix=".state-", suffix=".tmp", delete=False) as f:
+            temporary = f.name
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, path)
+        temporary = None
         print("  [State] 파일 저장 완료")
-
-        # 2026-08-31 보안점검 ⑦: os.system 문자열 조합 → subprocess 리스트 인자
-        # (인젝션 여지 제거 + 공백 포함 경로에서도 동작. os.popen 의 "echo $?" 는 Windows 셸에서 깨졌음)
-        import subprocess
-        def _git(*args):
-            return subprocess.run(["git", *args], capture_output=True, text=True)
-        _git("config", "user.name", "kimp-bot")
-        _git("config", "user.email", "bot@kimp-monitor")
-        _git("add", str(STATE_FILE))
-        if _git("diff", "--cached", "--quiet").returncode == 1:
-            _git("commit", "-m", "update state [skip ci]")
-            push = _git("push")
-            print("  [State] git push 완료" if push.returncode == 0 else f"  [State] git push 실패 (rc={push.returncode})")
-        else:
-            print("  [State] 변경사항 없음 — push 생략")
-    except Exception as e:
-        print(f"  [State] 저장 실패: {e}")
+    except (OSError, ValueError, TypeError, OverflowError) as e:
+        raise StateError(f"save failed ({type(e).__name__}); previous file preserved") from None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+    if publish:
+        publish_state(path)
 
 
 def add_history(state: dict, usdt_kimp, gold_kimp, now: datetime,
                 usd_krw=None, intl_gold_usd_oz=None, krx_gold_krw_g=None):
+    for label, value in (("usdt_kimp", usdt_kimp), ("gold_kimp", gold_kimp),
+                         ("usd_krw", usd_krw), ("intl_gold_usd_oz", intl_gold_usd_oz),
+                         ("krx_gold_krw_g", krx_gold_krw_g)):
+        if value is not None:
+            valid_number(value, label, positive=label not in ("usdt_kimp", "gold_kimp"))
     entry = {
         "time":            now.isoformat(),
         "usdt_kimp":       round(usdt_kimp, 4) if usdt_kimp is not None else None,
@@ -106,6 +225,7 @@ def should_alert(state: dict, key: str, current_value: float, now: datetime) -> 
     """
     테더 김프 전용 — 방향성 기반 알림 판단 (기존 로직 유지)
     """
+    current_value = valid_number(current_value, "premium")
     last_alert = state.get("last_alert", {})
     prev = last_alert.get(key)
 
@@ -148,6 +268,7 @@ def _get_gold_step_level(kimp_value: float, direction: str) -> int:
       +1% 추가     = level 1
       +2% 추가     = level 2  ...
     """
+    kimp_value = valid_number(kimp_value, "gold premium")
     if direction == "low":
         # GOLD_KIMP_LOW(예: 0%) 기준으로 아래로 얼마나 벗어났는지
         if kimp_value > GOLD_KIMP_LOW:
@@ -223,8 +344,10 @@ def update_alert_state(state: dict, key: str, value: float, now: datetime,
     """
     알림 상태 업데이트 (step_level, extra 데이터 포함 가능)
     """
+    value = valid_number(value, "alert premium")
     entry = {
-        "value": round(value, 4),
+        # Keep comparison precision: rounding can make an identical quote look worse.
+        "value": value,
         "time":  now.isoformat(),
     }
     if step_level is not None:
@@ -392,9 +515,9 @@ def get_upbit_usdt_price() -> float:
     url     = "https://api.upbit.com/v1/ticker"
     params  = {"markets": "KRW-USDT"}
     headers = {"Accept": "application/json"}
-    resp    = requests.get(url, params=params, headers=headers, timeout=10)
+    resp    = _requests().get(url, params=params, headers=headers, timeout=10)
     resp.raise_for_status()
-    price = float(resp.json()[0]["trade_price"])
+    price = valid_number(resp.json()[0]["trade_price"], "Upbit KRW/USDT", positive=True)
     print(f"  [Upbit] USDT/KRW = {price:,.2f}")
     return price
 
@@ -414,14 +537,14 @@ def get_usd_krw_rate() -> float:
             "https://m.stock.naver.com/front-api/marketIndex/prices"
             "?category=exchange&reutersCode=FX_USDKRW"
         )
-        resp = requests.get(url, headers=headers, timeout=10)
+        resp = _requests().get(url, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
         if data.get("isSuccess") and data.get("result"):
             item      = data["result"][0]
             traded_at = item.get("localTradedAt", "")
-            rate      = float(item["closePrice"].replace(",", ""))
+            rate      = valid_number(item["closePrice"].replace(",", ""), "Naver KRW/USD", positive=True)
 
             if traded_at == today_kst:
                 print(f"  [Naver] USD/KRW = {rate:,.2f}  (당일 {traded_at})")
@@ -436,8 +559,8 @@ def get_usd_krw_rate() -> float:
 
     try:
         print("  [Yahoo] 폴백: KRW=X 시도...")
-        ticker = yf.Ticker("KRW=X")
-        rate   = float(ticker.fast_info.last_price)
+        ticker = _ticker("KRW=X")
+        rate   = valid_number(ticker.fast_info.last_price, "Yahoo KRW/USD", positive=True)
         print(f"  [Yahoo] USD/KRW = {rate:,.2f}")
         return rate
     except Exception as e:
@@ -445,9 +568,9 @@ def get_usd_krw_rate() -> float:
 
     try:
         print("  [er-api] 폴백: 일간 환율 시도...")
-        resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        resp = _requests().get("https://open.er-api.com/v6/latest/USD", timeout=10)
         resp.raise_for_status()
-        rate = float(resp.json()["rates"]["KRW"])
+        rate = valid_number(resp.json()["rates"]["KRW"], "er-api KRW/USD", positive=True)
         print(f"  [er-api] USD/KRW = {rate:,.2f}  (주의: 일간 업데이트)")
         return rate
     except Exception as e:
@@ -469,10 +592,10 @@ def get_krx_gold_price_per_gram() -> float:
 
     try:
         url  = "https://api.stock.naver.com/marketindex/metals/M04020000"
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = _requests().get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         data  = resp.json()
-        price = float(data["closePrice"].replace(",", ""))
+        price = valid_number(data["closePrice"].replace(",", ""), "KRX KRW/g", positive=True)
         print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g  (네이버 API)")
         return price
     except Exception as e:
@@ -480,13 +603,13 @@ def get_krx_gold_price_per_gram() -> float:
 
     try:
         url  = "https://finance.naver.com/marketindex/goldDetail.naver"
-        resp = requests.get(url, headers=headers, timeout=15)
+        resp = _requests().get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         text = resp.text
         for pattern in [r"([\d,]+\.\d+)\s*원/g", r"([\d,]+)\s*원/g"]:
             match = re.search(pattern, text)
             if match:
-                price = float(match.group(1).replace(",", ""))
+                price = valid_number(match.group(1).replace(",", ""), "KRX KRW/g", positive=True)
                 print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g  (데스크톱 파싱)")
                 return price
     except Exception as e:
@@ -498,12 +621,14 @@ def get_krx_gold_price_per_gram() -> float:
 def get_international_gold_usd_per_oz() -> float:
     try:
         url  = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
-        resp = requests.get(url, timeout=10)
+        resp = _requests().get(url, timeout=10)
         resp.raise_for_status()
         data   = resp.json()
         prices = data[0]["spreadProfilePrices"][0]
-        bid    = prices["bid"]
-        ask    = prices["ask"]
+        bid    = valid_number(prices["bid"], "gold bid USD/oz", positive=True)
+        ask    = valid_number(prices["ask"], "gold ask USD/oz", positive=True)
+        if bid > ask:
+            raise ValueError("gold bid exceeds ask")
         spot   = (bid + ask) / 2
 
         if not (GOLD_PRICE_MIN_USD < spot < GOLD_PRICE_MAX_USD):
@@ -519,14 +644,14 @@ def get_international_gold_usd_per_oz() -> float:
 
     try:
         print("  [Yahoo] 폴백: GC=F 금 선물 시도...")
-        ticker = yf.Ticker("GC=F")
+        ticker = _ticker("GC=F")
         try:
-            price = float(ticker.fast_info.last_price)
+            price = valid_gold_price(ticker.fast_info.last_price)
         except Exception:
             hist = ticker.history(period="1d")
             if hist.empty:
                 raise RuntimeError("yfinance 히스토리 데이터 없음")
-            price = float(hist["Close"].iloc[-1])
+            price = valid_gold_price(hist["Close"].iloc[-1])
 
         if not (GOLD_PRICE_MIN_USD < price < GOLD_PRICE_MAX_USD):
             raise ValueError(f"비정상 금값 감지: ${price:,.2f}/oz")
@@ -544,7 +669,16 @@ def get_international_gold_usd_per_oz() -> float:
 # ═══════════════════════════════════════════════════════
 
 def calc_usdt_kimp(upbit_usdt: float, usd_krw: float) -> float:
-    return ((upbit_usdt - usd_krw) / usd_krw) * 100
+    upbit_usdt = valid_number(upbit_usdt, "Upbit KRW/USDT", positive=True)
+    usd_krw = valid_number(usd_krw, "KRW/USD", positive=True)
+    return valid_number(((upbit_usdt - usd_krw) / usd_krw) * 100, "USDT premium")
+
+
+def valid_gold_price(value):
+    price = valid_number(value, "international gold USD/oz", positive=True)
+    if not GOLD_PRICE_MIN_USD < price < GOLD_PRICE_MAX_USD:
+        raise ValueError("international gold outside allowed USD/oz range")
+    return price
 
 
 def calc_gold_kimp(
@@ -552,19 +686,23 @@ def calc_gold_kimp(
     intl_gold_usd_oz: float,
     usd_krw: float,
 ) -> tuple:
+    krx_gold_krw_g = valid_number(krx_gold_krw_g, "KRX KRW/g", positive=True)
+    intl_gold_usd_oz = valid_gold_price(intl_gold_usd_oz)
+    usd_krw = valid_number(usd_krw, "KRW/USD", positive=True)
     intl_gold_krw_g = (intl_gold_usd_oz * usd_krw) / TROY_OUNCE_TO_GRAM
+    intl_gold_krw_g = valid_number(intl_gold_krw_g, "international gold KRW/g", positive=True)
     kimp = ((krx_gold_krw_g - intl_gold_krw_g) / intl_gold_krw_g) * 100
-    return kimp, intl_gold_krw_g
+    return valid_number(kimp, "gold premium"), intl_gold_krw_g
 
 
 # ═══════════════════════════════════════════════════════
 #  알림
 # ═══════════════════════════════════════════════════════
 
-def send_telegram(message: str):
+def send_telegram(message: str) -> bool:
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("  [Telegram] 토큰/채팅ID 미설정 — 알림 건너뜀")
-        return
+        return False
     url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id":    TELEGRAM_CHAT_ID,
@@ -572,26 +710,70 @@ def send_telegram(message: str):
         "parse_mode": "HTML",
     }
     try:
-        resp = requests.post(url, json=payload, timeout=10)
-        if resp.ok:
+        resp = _requests().post(url, json=payload, timeout=10)
+        if resp.ok and resp.json().get("ok") is True:
             print("  [Telegram] 알림 전송 성공")
+            return True
         else:
-            try:
-                err = resp.json().get("description", resp.text)
-            except Exception:
-                err = resp.text
-            print(f"  [Telegram] 전송 실패: {resp.status_code} — {err}")
+            print(f"  [Telegram] 전송 실패: HTTP {resp.status_code}")
     except Exception as e:
         # 예외 문자열에 요청 URL(봇 토큰 포함)이 실릴 수 있어 타입만 남긴다 (2026-08-27 보안점검)
         print(f"  [Telegram] 전송 오류: {type(e).__name__}")
+    return False
 
 
 # ═══════════════════════════════════════════════════════
 #  메인
 # ═══════════════════════════════════════════════════════
 
-def main():
-    now = datetime.now(KST)
+
+def record_source_result(state, source, now, error=None):
+    health = state.setdefault("health", {}).setdefault(source, {})
+    if error is None:
+        health.update(status="ok", last_success=now.isoformat(), consecutive_failures=0)
+        for key in ("first_failure", "last_warning", "error_type"):
+            health.pop(key, None)
+    else:
+        health.update(status="error", last_failure=now.isoformat(), error_type=type(error).__name__)
+        health["consecutive_failures"] = health.get("consecutive_failures", 0) + 1
+        health.setdefault("first_failure", now.isoformat())
+
+
+def finish_run(state, now, failed_sources, failed_alerts, *, send_alerts,
+               persist_state, publish, state_file):
+    for source in failed_sources:
+        health = state["health"][source]
+        threshold = 1 if source == "fx" else SOURCE_FAILURE_ALERT_AFTER
+        if health["consecutive_failures"] >= threshold and "last_warning" not in health:
+            warning = (f"⚠ 시세 수집 실패: {source} "
+                       f"({health['consecutive_failures']}회 연속, {health['error_type']})")
+            if send_alerts:
+                if send_telegram(warning):
+                    health["last_warning"] = now.isoformat()
+                else:
+                    failed_alerts += 1
+            else:
+                print(f"  [Dry run] {warning}")
+    status = "ok"
+    if failed_sources or failed_alerts:
+        status = "failed" if "fx" in failed_sources or len(failed_sources) == 2 else "partial_failure"
+    state["run"] = {"time": now.isoformat(), "status": status,
+                    "failed_sources": list(failed_sources), "failed_alerts": failed_alerts}
+    if persist_state:
+        try:
+            save_state(state, publish=publish, state_file=state_file)
+        except StateError as error:
+            print(f"  [State] {error}")
+            return 1
+    else:
+        print("  [Dry run] 알림 전송·상태 저장·Git 게시 없음")
+    print(f"  결과: {status}")
+    return int(status != "ok")
+
+
+def run_monitor(*, send_alerts=False, persist_state=False, publish=False,
+                state_file=None, run_mode="", now=None):
+    now = now or datetime.now(KST)
     print(f"\n{'='*57}")
     print(f"  김치프리미엄 모니터  |  {now.strftime('%Y-%m-%d %H:%M:%S KST')}")
     print(f"  테더: 방향성 알림  |  금: 단계별 알림 ({GOLD_KIMP_STEP}%p 간격)")
@@ -599,25 +781,31 @@ def main():
 
     # ── 0. 상태 로드 ────────────────────────────────────
     print("\n[0] 알림 상태 로드")
-    state  = load_state()
+    try:
+        state = load_state(state_file)
+    except StateError as error:
+        print(f"  [State] {error}")
+        return 1
     alerts = []
+    failed_sources = []
 
     # ── 1. USD/KRW 환율 ─────────────────────────────────
     print("\n[1] USD/KRW 환율 조회")
     try:
-        usd_krw = get_usd_krw_rate()
+        usd_krw = valid_number(get_usd_krw_rate(), "KRW/USD", positive=True)
+        record_source_result(state, "fx", now)
     except Exception as e:
-        msg = f"❌ USD/KRW 환율 조회 실패: {e}"
-        print(msg)
-        send_telegram(msg)
-        sys.exit(1)
+        print(f"❌ USD/KRW 환율 조회 실패: {type(e).__name__}")
+        record_source_result(state, "fx", now, e)
+        return finish_run(state, now, ["fx"], 0, send_alerts=send_alerts,
+                          persist_state=persist_state, publish=publish, state_file=state_file)
 
     # ── 2. 테더 김프 (기존 로직 유지) ───────────────────
     print("\n[2] 테더 김프 계산")
     usdt_kimp  = None
     upbit_usdt = None
     try:
-        upbit_usdt = get_upbit_usdt_price()
+        upbit_usdt = valid_number(get_upbit_usdt_price(), "KRW/USDT", positive=True)
         usdt_kimp  = calc_usdt_kimp(upbit_usdt, usd_krw)
         print(f"  ▶ 테더 김프 = {usdt_kimp:+.2f}%")
 
@@ -632,8 +820,7 @@ def main():
                     f"환율: {usd_krw:,.2f}원\n"
                     f"⏰ {now.strftime('%H:%M KST')}"
                 )
-                alerts.append(alert_msg)
-                update_alert_state(state, "usdt_low", usdt_kimp, now)
+                alerts.append((alert_msg, "usdt_low", usdt_kimp, None, None))
             state.get("last_alert", {}).pop("usdt_high", None)
 
         elif usdt_kimp >= USDT_KIMP_HIGH:
@@ -646,8 +833,7 @@ def main():
                     f"환율: {usd_krw:,.2f}원\n"
                     f"⏰ {now.strftime('%H:%M KST')}"
                 )
-                alerts.append(alert_msg)
-                update_alert_state(state, "usdt_high", usdt_kimp, now)
+                alerts.append((alert_msg, "usdt_high", usdt_kimp, None, None))
             state.get("last_alert", {}).pop("usdt_low", None)
 
         else:
@@ -657,8 +843,13 @@ def main():
                 la.pop("usdt_high", None)
                 print("  [State] 테더 정상 복귀 → 상태 초기화")
 
+        record_source_result(state, "usdt", now)
+
     except Exception as e:
-        print(f"  ⚠ 테더 김프 계산 실패: {e}")
+        usdt_kimp = upbit_usdt = None
+        failed_sources.append("usdt")
+        record_source_result(state, "usdt", now, e)
+        print(f"  ⚠ 테더 김프 계산 실패: {type(e).__name__}")
 
     # ── 3. 금 김프 (★ 단계별 알림 + 원인 분석) ────────
     print("\n[3] 금 김프 계산")
@@ -667,8 +858,8 @@ def main():
     intl_gold_oz    = None
     intl_gold_krw_g = None
     try:
-        krx_gold                   = get_krx_gold_price_per_gram()
-        intl_gold_oz               = get_international_gold_usd_per_oz()
+        krx_gold                   = valid_number(get_krx_gold_price_per_gram(), "KRX KRW/g", positive=True)
+        intl_gold_oz               = valid_gold_price(get_international_gold_usd_per_oz())
         gold_kimp, intl_gold_krw_g = calc_gold_kimp(krx_gold, intl_gold_oz, usd_krw)
 
         print(f"  ▶ 금 김프 = {gold_kimp:+.2f}%")
@@ -696,22 +887,14 @@ def main():
                     f"\n{driver_analysis}\n"
                     f"\n⏰ {now.strftime('%H:%M KST')}"
                 )
-                alerts.append(alert_msg)
-                update_alert_state(
-                    state, "gold_low", gold_kimp, now,
-                    step_level=step_level,
-                    extra={
+                alerts.append((
+                    alert_msg, "gold_low", gold_kimp, step_level,
+                    {
                         "usd_krw": round(usd_krw, 2),
                         "intl_gold_usd_oz": round(intl_gold_oz, 2),
                         "krx_gold_krw_g": round(krx_gold, 0),
                     }
-                )
-            else:
-                # 알림은 안 보내지만, 비교용 데이터는 갱신
-                # (다음 알림의 원인 분석 정확도를 위해)
-                pass
-
-            # 반대 방향 상태 클리어
+                ))
             state.get("last_alert", {}).pop("gold_high", None)
 
         # ── 상승 방향 알림 (단계별) ──
@@ -729,16 +912,14 @@ def main():
                     f"\n{driver_analysis}\n"
                     f"\n⏰ {now.strftime('%H:%M KST')}"
                 )
-                alerts.append(alert_msg)
-                update_alert_state(
-                    state, "gold_high", gold_kimp, now,
-                    step_level=step_level,
-                    extra={
+                alerts.append((
+                    alert_msg, "gold_high", gold_kimp, step_level,
+                    {
                         "usd_krw": round(usd_krw, 2),
                         "intl_gold_usd_oz": round(intl_gold_oz, 2),
                         "krx_gold_krw_g": round(krx_gold, 0),
                     }
-                )
+                ))
             state.get("last_alert", {}).pop("gold_low", None)
 
         # ── 정상 범위 복귀 ──
@@ -749,8 +930,13 @@ def main():
                 la.pop("gold_high", None)
                 print("  [State] 금 김프 정상 복귀 → 상태 초기화")
 
+        record_source_result(state, "gold", now)
+
     except Exception as e:
-        print(f"  ⚠ 금 김프 계산 실패: {e}")
+        gold_kimp = krx_gold = intl_gold_oz = intl_gold_krw_g = None
+        failed_sources.append("gold")
+        record_source_result(state, "gold", now, e)
+        print(f"  ⚠ 금 김프 계산 실패: {type(e).__name__}")
 
     # ── 이력 기록 (환율/금값 포함) ───────────────────────
     add_history(state, usdt_kimp, gold_kimp, now,
@@ -777,7 +963,6 @@ def main():
             next_trigger = GOLD_KIMP_HIGH + ((cur_level + 1) * GOLD_KIMP_STEP)
             print(f"          금 현재 Level {cur_level} — 다음 알림: {next_trigger:+.0f}% 이상")
 
-    run_mode  = os.environ.get("RUN_MODE") or ""
     is_manual = run_mode == "workflow_dispatch"
     print(f"  모드  : {'수동' if is_manual else '스케줄'}  (RUN_MODE={run_mode!r})")
 
@@ -807,24 +992,57 @@ def main():
             if 'driver_analysis' in dir():
                 report += f"\n{driver_analysis}\n"
         report += f"\n⏰ {now.strftime('%Y-%m-%d %H:%M KST')}"
-        alerts.append(report)
+        alerts.append((report, None, None, None, None))
 
     # ── 6. 알림 전송 ────────────────────────────────────
     print(f"\n[4] 알림 전송 ({len(alerts)}건)")
+    failed_alerts = 0
     if alerts:
-        for msg in alerts:
-            send_telegram(msg)
+        for msg, key, value, step_level, extra in alerts:
+            if not send_alerts:
+                print(f"  [Dry run] 알림 후보: {key or 'manual_report'}")
+                continue
+            if send_telegram(msg):
+                if key is not None:
+                    update_alert_state(state, key, value, now, step_level=step_level, extra=extra)
+            else:
+                failed_alerts += 1
     else:
         print("  알림 없음 (조건 미충족 / 같은 단계 내 변동 / 개선 방향)")
 
     # ── 7. 상태 저장 ────────────────────────────────────
     print("\n[5] 상태 저장")
-    save_state(state)
+    result = finish_run(state, now, failed_sources, failed_alerts, send_alerts=send_alerts,
+                        persist_state=persist_state, publish=publish, state_file=state_file)
 
     print(f"\n{'='*57}")
     print(f"  완료  |  {datetime.now(KST).strftime('%H:%M:%S KST')}")
     print(f"{'='*57}\n")
+    return result
+
+
+def main(argv=None, *, environ=None):
+    parser = argparse.ArgumentParser(description="USDT/금 김프 모니터. 옵션 없이는 외부 작업을 실행하지 않습니다.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--live", action="store_true", help="시세 조회, 알림 전송, 상태 저장")
+    mode.add_argument("--dry-run", action="store_true", help="시세 조회만 실행; 알림/저장/Git 없음")
+    parser.add_argument("--publish-state", action="store_true", help="--live 상태를 Git commit/push (명시적 선택)")
+    parser.add_argument("--state-file", default=STATE_FILE, help="로컬 상태 파일 경로")
+    args = parser.parse_args(argv)
+    if args.publish_state and (not args.live or os.path.abspath(args.state_file) != STATE_FILE):
+        parser.error("--publish-state requires --live and the repository state.json")
+    if not args.live and not args.dry_run:
+        parser.print_help()
+        return 0
+    environ = os.environ if environ is None else environ
+    try:
+        configure(environ)
+    except ValueError as error:
+        print(f"  [Config] {error}")
+        return 1
+    return run_monitor(send_alerts=args.live, persist_state=args.live, publish=args.publish_state,
+                       state_file=args.state_file, run_mode=environ.get("RUN_MODE") or "")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

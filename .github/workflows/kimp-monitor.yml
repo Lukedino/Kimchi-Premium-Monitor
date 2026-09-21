@@ -5,6 +5,10 @@ on:
     - cron: '*/15 * * * *'
   workflow_dispatch:
 
+concurrency:
+  group: kimp-state-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -17,6 +21,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref_name }}
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -35,4 +40,4 @@ jobs:
           USDT_KIMP_HIGH: ${{ vars.USDT_KIMP_HIGH }}
           GOLD_KIMP_LOW: ${{ vars.GOLD_KIMP_LOW }}
           GOLD_KIMP_HIGH: ${{ vars.GOLD_KIMP_HIGH }}
-        run: python monitor.py
+        run: python monitor.py --live --publish-state
