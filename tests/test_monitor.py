@@ -467,9 +467,15 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(call.kwargs["timeout"], 30)
 
     def test_git_no_change_does_not_commit_or_push(self):
-        with patch.object(subprocess, "run", return_value=SimpleNamespace(returncode=0)) as git:
+        revision = "a" * 40
+        outputs = ["", "", "refs/heads/main\n",
+                   "refs/heads/main\0refs/remotes/origin/main\0origin\0refs/heads/main\n",
+                   revision + "\n", revision + "\n", "0\t0\n"]
+        with patch.object(subprocess, "run", side_effect=[
+                SimpleNamespace(returncode=0, stdout=value) for value in outputs]) as git:
             m.publish_state(m.STATE_FILE)
-        self.assertEqual(git.call_count, 2)
+        commands = [call.args[0] for call in git.call_args_list]
+        self.assertFalse(any("commit" in args or "push" in args for args in commands))
 
     def test_git_timeout_is_visible_without_command_output(self):
         with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("secret-command", 30)), \

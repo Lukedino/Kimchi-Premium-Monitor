@@ -16,6 +16,7 @@ import argparse
 import subprocess
 import tempfile
 from datetime import datetime, timezone, timedelta
+from state_lock import StateLockError, state_execution_lock
 
 # ─── 상수 ───────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))
@@ -138,32 +139,99 @@ def load_state(state_file=None) -> dict:
 
 def publish_state(state_file):
     directory = os.path.dirname(os.path.abspath(__file__))
-    if os.path.abspath(state_file) != os.path.join(directory, "state.json"):
+    actual = os.path.normcase(os.path.realpath(state_file))
+    expected_path = os.path.normcase(os.path.realpath(os.path.join(directory, "state.json")))
+    if actual != expected_path:
         raise StateError("only the repository state.json can be published")
 
-    def git(*args, allowed=(0,)):
+    def git(*args, allowed=(0,), output=False):
         operation = "commit" if "commit" in args else args[0]
         try:
             result = subprocess.run(
                 ["git", *args], cwd=directory, capture_output=True, text=True, timeout=30,
             )
-        except (OSError, subprocess.TimeoutExpired) as e:
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as e:
             raise StateError(f"git {operation} failed ({type(e).__name__})") from None
         if result.returncode not in allowed:
             raise StateError(f"git {operation} failed (rc={result.returncode})")
+        if output:
+            if not isinstance(getattr(result, "stdout", None), str):
+                raise StateError(f"git {operation} returned invalid output")
+            return result.stdout
         return result.returncode
 
     git("add", "--", "state.json")
     changed = git("diff", "--cached", "--quiet", "--", "state.json", allowed=(0, 1))
+    push_args = ("push",)
     if changed == 0:
-        print("  [State] 변경사항 없음 — push 생략")
-        return
-    git("-c", "user.name=kimp-bot", "-c", "user.email=bot@kimp-monitor",
-        "commit", "--only", "-m", "update state [skip ci]", "--", "state.json")
+        # A previous commit may have succeeded while both pushes failed. Query
+        # only local refs; uncertainty is an error, never evidence of publication.
+        branch = git("symbolic-ref", "--quiet", "HEAD", output=True).strip()
+        if not branch.startswith("refs/heads/") or any(c.isspace() for c in branch):
+            raise StateError("state publication requires an attached branch")
+        fields = git(
+            "for-each-ref",
+            "--format=%(refname)%00%(upstream)%00%(upstream:remotename)%00%(upstream:remoteref)",
+            branch, output=True,
+        ).rstrip("\n").split("\0")
+        if len(fields) != 4 or fields[0] != branch:
+            raise StateError("state publication upstream does not match the branch")
+        _, upstream, remote, remote_ref = fields
+        if (not remote or remote == "." or remote.startswith("-")
+                or any(c.isspace() for c in remote + upstream + remote_ref)
+                or not upstream.startswith(f"refs/remotes/{remote}/")
+                or not remote_ref.startswith("refs/heads/")
+                or remote_ref == "refs/heads/"):
+            raise StateError("state publication requires a remote branch upstream")
+
+        def revision(ref):
+            value = git("rev-parse", "--verify", ref, output=True).strip()
+            if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", value):
+                raise StateError("state publication returned an invalid revision")
+            return value
+
+        head, base = revision("HEAD"), revision(upstream)
+        counts = git("rev-list", "--left-right", "--count", f"{base}...{head}", output=True).strip()
+        match = re.fullmatch(r"([0-9]+)\s+([0-9]+)", counts)
+        if match is None:
+            raise StateError("state publication returned invalid ahead/behind counts")
+        behind, ahead = map(int, match.groups())
+        if behind:
+            raise StateError("state publication branch is behind or diverged from upstream")
+        if not ahead:
+            if head != base:
+                raise StateError("state publication revision/count mismatch")
+            print("  [State] 변경사항·미게시 커밋 없음 — push 생략")
+            return
+
+        commits = git("rev-list", "--reverse", f"{base}..{head}", output=True).splitlines()
+        if len(commits) != ahead or not commits or commits[-1] != head:
+            raise StateError("state publication pending history is inconsistent")
+        previous = base
+        for commit in commits:
+            if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit):
+                raise StateError("state publication pending revision is invalid")
+            metadata = git("show", "-s", "--format=%P%x00%an%x00%ae%x00%cn%x00%ce%x00%B",
+                           commit, output=True).rstrip("\n").split("\0")
+            expected = [previous, "kimp-bot", "bot@kimp-monitor", "kimp-bot",
+                        "bot@kimp-monitor", "update state [skip ci]"]
+            if metadata != expected:
+                raise StateError("pending history contains an untrusted or non-linear commit")
+            names = git("diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z",
+                        commit, "--", output=True)
+            if names != "state.json\0":
+                raise StateError("pending history is not exclusively state.json changes")
+            previous = commit
+        # Freeze the verified tip and target. push.default, remote push refspecs
+        # and automatic tag following must not publish unrelated user work.
+        push_args = ("push", "--no-follow-tags", "--", remote, f"{head}:{remote_ref}")
+    else:
+        git("-c", "user.name=kimp-bot", "-c", "user.email=bot@kimp-monitor",
+            "commit", "--only", "-m", "update state [skip ci]", "--", "state.json")
     # Retry the same push once; never fetch/rebase/force over competing state.
     for attempt in range(2):
         try:
-            git("push")
+            git(*push_args)
             print("  [State] git push 완료")
             return
         except StateError:
@@ -773,6 +841,22 @@ def finish_run(state, now, failed_sources, failed_alerts, *, send_alerts,
 
 def run_monitor(*, send_alerts=False, persist_state=False, publish=False,
                 state_file=None, run_mode="", now=None):
+    options = dict(send_alerts=send_alerts, persist_state=persist_state, publish=publish,
+                   state_file=state_file, run_mode=run_mode, now=now)
+    if not (send_alerts or persist_state or publish):
+        return _run_monitor(**options)
+    try:
+        # Hold one OS lock from the first state read through delivery and publication.
+        with state_execution_lock(state_file or STATE_FILE) as canonical_state:
+            options["state_file"] = canonical_state
+            return _run_monitor(**options)
+    except StateLockError as error:
+        print(f"  [State] {error}")
+        return 1
+
+
+def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
+                 state_file=None, run_mode="", now=None):
     now = now or datetime.now(KST)
     print(f"\n{'='*57}")
     print(f"  김치프리미엄 모니터  |  {now.strftime('%Y-%m-%d %H:%M:%S KST')}")
