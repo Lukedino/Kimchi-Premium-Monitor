@@ -1,14 +1,6 @@
 {
   "history": [
     {
-      "time": "2026-09-20T20:42:57.373240+09:00",
-      "usdt_kimp": -1.3669,
-      "gold_kimp": -0.1805,
-      "usd_krw": 1390.0,
-      "intl_gold_usd_oz": 4378.28,
-      "krx_gold_krw_g": 195310.0
-    },
-    {
       "time": "2026-09-20T23:53:18.873662+09:00",
       "usdt_kimp": -1.5108,
       "gold_kimp": -0.1805,
@@ -79,6 +71,14 @@
       "usd_krw": 1375.0,
       "intl_gold_usd_oz": 4343.7,
       "krx_gold_krw_g": 193370.0
+    },
+    {
+      "time": "2026-09-22T09:07:22.839577+09:00",
+      "usdt_kimp": -1.3273,
+      "gold_kimp": 0.2616,
+      "usd_krw": 1371.2,
+      "intl_gold_usd_oz": 4372.36,
+      "krx_gold_krw_g": 193260.0
     }
   ],
   "last_alert": {
@@ -90,22 +90,22 @@
   "health": {
     "fx": {
       "status": "ok",
-      "last_success": "2026-09-22T06:04:56.116691+09:00",
+      "last_success": "2026-09-22T09:07:22.839577+09:00",
       "consecutive_failures": 0
     },
     "usdt": {
       "status": "ok",
-      "last_success": "2026-09-22T06:04:56.116691+09:00",
+      "last_success": "2026-09-22T09:07:22.839577+09:00",
       "consecutive_failures": 0
     },
     "gold": {
       "status": "ok",
-      "last_success": "2026-09-22T06:04:56.116691+09:00",
+      "last_success": "2026-09-22T09:07:22.839577+09:00",
       "consecutive_failures": 0
     }
   },
   "run": {
-    "time": "2026-09-22T06:04:56.116691+09:00",
+    "time": "2026-09-22T09:07:22.839577+09:00",
     "status": "ok",
     "failed_sources": [],
     "failed_alerts": 0
