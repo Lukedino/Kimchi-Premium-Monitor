@@ -36,6 +36,16 @@ def guard_transports(reject):
     return requests, curl_cffi
 
 
+def packaged_dateutil():
+    # pandas import 도중 gettz가 호출되므로 소비자 import보다 먼저 설정한다.
+    # OS TZPATHS/TZFILES를 허용하지 않고 고정 wheel의 zoneinfo archive만 사용한다.
+    from dateutil.tz import tz
+    tz.TZPATHS = ()
+    tz.TZFILES = ()
+    tz.gettz.cache_clear()
+    return tz
+
+
 def verify(source, site, reject):
     expected = dict(re.findall(r"^([\w.-]+)==([^\s\\]+)",
                               (source / "locks/dependency-smoke.txt").read_text(), re.MULTILINE))
@@ -51,6 +61,7 @@ def verify(source, site, reject):
     assert expected and all(installed.get(k) == v for k, v in expected.items()), "PACKAGE_MISMATCH"
     assert not set(installed) - set(expected) - {"pip", "setuptools", "wheel"}, "UNLOCKED_PACKAGE"
 
+    dateutil_tz = packaged_dateutil()
     requests, curl_cffi = guard_transports(reject)
     import certifi
     import numpy as np
@@ -77,11 +88,15 @@ def verify(source, site, reject):
     assert not np.isfinite(np.array([np.nan, np.inf])).any(), "NONFINITE_RESULT_MISMATCH"
     offsets = {"UTC": (0, 0), "Asia/Seoul": (32400, 32400), "America/New_York": (-18000, -14400)}
     assert zoneinfo.TZPATH == (), "SYSTEM_TZPATH_ACTIVE"
+    assert dateutil_tz.TZPATHS == () and dateutil_tz.TZFILES == (), "SYSTEM_DATEUTIL_TZPATH_ACTIVE"
     for zone, expected_offsets in offsets.items():
         for month, seconds in zip((1, 7), expected_offsets):
             value = datetime(2001, month, 15, 12)
             assert value.replace(tzinfo=ZoneInfo(zone)).utcoffset().total_seconds() == seconds, "ZONEINFO_OFFSET_MISMATCH"
             assert pd.Timestamp(value).tz_localize(zone).utcoffset().total_seconds() == seconds, "PANDAS_OFFSET_MISMATCH"
+            dateutil_zone = dateutil_tz.gettz(zone)
+            assert dateutil_zone is not None, "DATEUTIL_ZONE_MISSING"
+            assert value.replace(tzinfo=dateutil_zone).utcoffset().total_seconds() == seconds, "DATEUTIL_OFFSET_MISMATCH"
 
     from lxml import etree
     from bs4 import BeautifulSoup
@@ -98,6 +113,9 @@ def verify(source, site, reject):
     finally:
         db.close()
     # guard 자체의 차단 시험은 별도 프로세스에서 수행한다. 여기서는 0 이벤트가 필수다.
-    return {"packages": len(expected), "versions": expected, "zone_checks": 6, "system_tzpath_empty": True,
+    return {"packages": len(expected), "installed_packages": len(installed), "versions": expected,
+            "zone_checks": 6, "dateutil_zone_checks": 6, "system_tzpath_empty": True,
+            "dateutil_system_paths_empty": True,
+            "bootstrap_packages": public_packages({k: v for k, v in installed.items() if k not in expected}),
             "checks": ["requests_prepare", "certifi_ssl", "curl_native", "cffi_memory",
                        "numpy_pandas", "zoneinfo_pandas", "lxml_bs4", "protobuf", "sqlite", "yfinance_import"]}

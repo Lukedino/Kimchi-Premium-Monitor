@@ -10,12 +10,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/dependency-smoke.yml"
 COMMANDS = {
-    "python -I -m pip --isolated install --index-url https://pypi.org/simple "
+    "python -I -m venv --without-pip .venv-test",
+    "python -I -m pip --isolated --python .venv-test install --index-url https://pypi.org/simple "
     "--only-binary=:all: --require-hashes -r locks/dependency-smoke.txt",
-    "python -I -m pip --isolated check",
-    "python -I -S -B -X utf8 scripts/dependency_smoke.py --self-check",
-    "python -I -S -B -X utf8 scripts/dependency_smoke.py --environment-check",
-    "python -I -S -B -X utf8 scripts/dependency_smoke.py --contract-check",
+    "python -I -m pip --isolated --python .venv-test check",
+    "${{ matrix.pythonexe }} -I -S -B -X utf8 scripts/dependency_smoke.py --self-check",
+    "${{ matrix.pythonexe }} -I -S -B -X utf8 scripts/dependency_smoke.py --environment-check",
+    "${{ matrix.pythonexe }} -I -S -B -X utf8 scripts/dependency_smoke.py --contract-check",
 }
 
 
@@ -30,6 +31,8 @@ def check_workflow(text):
     if re.findall(r"^\s+contents: (.+)$", text, re.M) != ["read"]:
         return False
     if "os: [ubuntu-latest, windows-latest]" not in text or "python: ['3.11', '3.12']" not in text:
+        return False
+    if re.findall(r"^\s+pythonexe: (.+)$", text, re.M) != [".venv-test/bin/python", ".venv-test/Scripts/python.exe"]:
         return False
     if re.findall(r"timeout-minutes: (\d+)", text) != ["10"]:
         return False
@@ -52,7 +55,7 @@ def check_workflow(text):
                 content = " ".join(continuation)
             commands.append(content)
         index += 1
-    return len(commands) == 5 and set(commands) == COMMANDS
+    return len(commands) == 6 and set(commands) == COMMANDS
 
 
 def pins_and_hashes(text):
@@ -95,6 +98,9 @@ class DependencyContractTests(unittest.TestCase):
             source + "\n        shell: bash --noprofile --norc -e -o pipefail {0}\n",
             source + "\n        env:\n          TOKEN: ${{ secrets.SYNTHETIC }}\n",
             source.replace("pull_request:", "pull_request_target:"),
+            source.replace("--without-pip ", ""),
+            source.replace("--python .venv-test ", ""),
+            source.replace("pythonexe: .venv-test/bin/python", "pythonexe: python"),
         ]
         for index, value in enumerate(mutations):
             with self.subTest(index=index):
@@ -162,6 +168,20 @@ class DependencyContractTests(unittest.TestCase):
         self.assertEqual(sanitize({"packaging": "26.3"}), {"packaging": "26.3"})
         value = sanitize({"/private/canary": "SYNTHETIC_PRIVATE", "package": "secret\nvalue"})
         self.assertEqual(value, {"invalid_distribution_metadata": "redacted"})
+
+    def test_dateutil_package_fallback_does_not_keep_system_paths(self):
+        # stdlib CI에는 dateutil을 설치하지 않는다. 실제 offset은 native가 검증한다.
+        scope = runpy.run_path(str(ROOT / "scripts/dependency_native.py"))
+        from types import ModuleType, SimpleNamespace
+        from unittest.mock import patch, Mock
+        getter = Mock()
+        tz = SimpleNamespace(TZPATHS=("/synthetic/system",), TZFILES=("/synthetic/localtime",), gettz=getter)
+        package = ModuleType("dateutil.tz"); package.tz = tz
+        with patch.dict("sys.modules", {"dateutil.tz": package}):
+            self.assertIs(scope["packaged_dateutil"](), tz)
+        self.assertEqual(tz.TZPATHS, ())
+        self.assertEqual(tz.TZFILES, ())
+        getter.cache_clear.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -22,6 +22,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
         python: ['3.11', '3.12']
+        include:
+          - os: ubuntu-latest
+            pythonexe: .venv-test/bin/python
+          - os: windows-latest
+            pythonexe: .venv-test/Scripts/python.exe
     steps:
       - uses: actions/checkout@v4
         with:
@@ -29,15 +34,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - name: Create a separate environment without preinstalled runner tools
+        run: python -I -m venv --without-pip .venv-test
       - name: Install public locked wheels without credentials
         run: >-
-          python -I -m pip --isolated install --index-url https://pypi.org/simple
+          python -I -m pip --isolated --python .venv-test install --index-url https://pypi.org/simple
           --only-binary=:all: --require-hashes -r locks/dependency-smoke.txt
       - name: Check installed dependency compatibility
-        run: python -I -m pip --isolated check
+        run: python -I -m pip --isolated --python .venv-test check
       - name: Check accidental I/O guards
-        run: python -I -S -B -X utf8 scripts/dependency_smoke.py --self-check
+        run: ${{ matrix.pythonexe }} -I -S -B -X utf8 scripts/dependency_smoke.py --self-check
       - name: Check actual packages without providers
-        run: python -I -S -B -X utf8 scripts/dependency_smoke.py --environment-check
+        run: ${{ matrix.pythonexe }} -I -S -B -X utf8 scripts/dependency_smoke.py --environment-check
       - name: Check workflow and lock safety contracts
-        run: python -I -S -B -X utf8 scripts/dependency_smoke.py --contract-check
+        run: ${{ matrix.pythonexe }} -I -S -B -X utf8 scripts/dependency_smoke.py --contract-check
