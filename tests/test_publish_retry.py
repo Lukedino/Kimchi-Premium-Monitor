@@ -21,6 +21,9 @@ class FakeGit:
         self.base = "1" * 40
         self.pending = []
         self.changed = False
+        self.staged_state = False
+        self.commit_hook = None
+        self.remote_urls = "https://github.com/synthetic/monitor.git\n"
         self.behind = 0
         self.branch = "refs/heads/main"
         self.upstream = "refs/remotes/origin/main"
@@ -61,16 +64,21 @@ class FakeGit:
         assert kwargs["text"] is True
         args = command[1:]
         self.calls.append(args)
-        operation = "commit" if "commit" in args else args[0]
+        operation = args[4] if args[0] == "-c" else args[0]
         if operation in self.failures:
             error = self.failures[operation]
             if isinstance(error, BaseException):
                 raise error
             return SimpleNamespace(returncode=error, stdout="synthetic-secret", stderr="synthetic-secret")
         code, output = 0, ""
-        if args == ["add", "--", "state.json"]:
+        if args == ["diff", "--cached", "--quiet", "--", "state.json"]:
+            code = int(self.staged_state)
+        elif args == ["ls-files", "--error-unmatch", "--", "state.json"]:
             pass
-        elif args == ["diff", "--cached", "--quiet", "--", "state.json"]:
+        elif args[:4] == ["remote", "get-url", "--push", "--all"]:
+            assert args[4] == self.remote
+            output = self.remote_urls
+        elif args == ["diff", "--quiet", "HEAD", "--", "state.json"]:
             code = int(self.changed)
         elif operation == "commit":
             assert args == ["-c", "user.name=kimp-bot", "-c", "user.email=bot@kimp-monitor",
@@ -79,6 +87,8 @@ class FakeGit:
             self.add_bot_commit()
             self.changed = False
             self.commit_count += 1
+            if self.commit_hook:
+                self.commit_hook(self)
         elif args == ["symbolic-ref", "--quiet", "HEAD"]:
             output = self.branch + "\n"
         elif args[0] == "for-each-ref":
@@ -97,7 +107,8 @@ class FakeGit:
                 commit["sha"] + "\n" for commit in self.pending)
         elif args[:2] == ["show", "-s"]:
             commit = next(commit for commit in self.pending if commit["sha"] == args[-1])
-            output = "\0".join(commit["metadata"]) + "\n\n"
+            output = (commit["metadata"][0] if args[2] == "--format=%P" else
+                      "\0".join(commit["metadata"])) + "\n\n"
         elif args[:6] == ["diff-tree", "--no-commit-id", "--name-only", "--no-renames", "-r", "-z"]:
             assert args[-1] == "--"
             commit = next(commit for commit in self.pending if commit["sha"] == args[-2])
@@ -141,7 +152,8 @@ class PublicationRetryTests(unittest.TestCase):
             self.publish()
         tip = self.git.head
         self.assertEqual(self.git.commit_count, 1)
-        self.assertEqual(self.git.pushes, [["push"], ["push"]])
+        expected = ["push", "--no-follow-tags", "--", "origin", f"{tip}:refs/heads/main"]
+        self.assertEqual(self.git.pushes, [expected, expected])
 
         self.publish()
 
@@ -155,6 +167,66 @@ class PublicationRetryTests(unittest.TestCase):
         self.assertEqual(self.git.pushes, [])
         self.assertEqual(self.git.commit_count, 0)
         self.assertTrue(any(args[0] == "rev-list" for args in self.git.calls))
+
+    def test_changed_state_after_user_commit_stops_before_any_index_change(self):
+        self.git.changed = True
+        self.git.add_bot_commit()["metadata"][1] = "Developer"
+        self.assert_blocked()
+        self.assertFalse(any(args[0] in {"add", "reset"} for args in self.git.calls))
+        self.assertTrue(self.git.changed)
+
+    def test_changed_state_also_requires_branch_upstream_and_linear_history(self):
+        for defect in ("detached", "missing_upstream", "behind", "other_path"):
+            with self.subTest(defect=defect):
+                self.git.__init__()
+                self.git.changed = True
+                if defect == "detached":
+                    self.git.failures["symbolic-ref"] = 1
+                elif defect == "missing_upstream":
+                    self.git.ref_output = self.git.branch + "\0\0\0\n"
+                elif defect == "behind":
+                    self.git.behind = 1
+                else:
+                    self.git.add_bot_commit()["paths"] = "README.md\0"
+                self.assert_blocked()
+
+    def test_staged_state_is_preserved_without_commit_or_push(self):
+        self.git.changed = self.git.staged_state = True
+        self.assert_blocked()
+        self.assertTrue(self.git.staged_state)
+        self.assertFalse(any(args[0] in {"add", "reset"} for args in self.git.calls))
+
+    def test_new_commit_on_pending_bot_chain_uses_exact_target_and_validates_parent(self):
+        self.git.changed = True
+        self.git.remote = "state-origin"
+        self.git.upstream = "refs/remotes/state-origin/published"
+        self.git.remote_ref = "refs/heads/published"
+        previous = self.git.add_bot_commit()["sha"]
+        self.publish()
+        self.assertEqual(self.git.commit_count, 1)
+        self.assertEqual(self.git.pushes, [["push", "--no-follow-tags", "--", "state-origin",
+                                           f"{self.git.head}:refs/heads/published"]])
+        self.assertNotEqual(self.git.head, previous)
+
+    def test_branch_or_upstream_change_during_commit_prevents_push(self):
+        for field, value in (("branch", "refs/heads/other"),
+                             ("remote_ref", "refs/heads/other"),
+                             ("base", "f" * 40)):
+            with self.subTest(field=field):
+                self.git.__init__()
+                self.git.changed = True
+                self.git.commit_hook = lambda git: setattr(git, field, value)
+                with self.assertRaises(monitor.StateError):
+                    self.publish()
+                self.assertEqual(self.git.commit_count, 1)
+                self.assertEqual(self.git.pushes, [])
+
+    def test_new_commit_with_hook_added_path_is_not_published(self):
+        self.git.changed = True
+        self.git.commit_hook = lambda git: git.pending[-1].update(paths="state.json\0README.md\0")
+        with self.assertRaises(monitor.StateError):
+            self.publish()
+        self.assertEqual(self.git.pushes, [])
 
     def test_existing_linear_bot_chain_uses_one_verified_tip_and_upstream_target(self):
         self.git.branch = "refs/heads/state-worker"

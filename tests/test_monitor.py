@@ -446,36 +446,40 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn("synthetic-token", self.output.getvalue())
 
     def test_git_each_stage_failure_is_observable(self):
-        for codes, expected_calls in (([2], 1), ([0, 2], 2), ([0, 1, 2], 3), ([0, 1, 0, 2, 2], 5)):
-            with self.subTest(codes=codes):
-                results = [SimpleNamespace(returncode=code) for code in codes]
-                with patch.object(subprocess, "run", side_effect=results) as git, self.assertRaises(m.StateError):
+        from test_publish_retry import FakeGit
+        for operation in ("symbolic-ref", "for-each-ref", "rev-parse", "rev-list",
+                          "diff", "ls-files", "commit", "show", "diff-tree", "push"):
+            with self.subTest(operation=operation):
+                fake = FakeGit()
+                fake.changed = True
+                fake.failures[operation] = 2
+                with patch.object(subprocess, "run", side_effect=fake), self.assertRaises(m.StateError):
                     m.publish_state(m.STATE_FILE)
-                self.assertEqual(git.call_count, expected_calls)
+                self.assertNotIn("synthetic-secret", self.output.getvalue())
 
     def test_git_retry_is_bounded_and_never_rebases_or_forces(self):
-        results = [SimpleNamespace(returncode=code) for code in (0, 1, 0, 2, 0)]
-        with patch.object(subprocess, "run", side_effect=results) as git:
+        from test_publish_retry import FakeGit
+        fake = FakeGit()
+        fake.changed = True
+        fake.push_results = [2, 0]
+        with patch.object(subprocess, "run", side_effect=fake):
             m.publish_state(m.STATE_FILE)
-        commands = [call.args[0] for call in git.call_args_list]
-        self.assertEqual(commands[-2:], [["git", "push"], ["git", "push"]])
-        self.assertIn("--only", commands[2])
-        self.assertEqual(commands[2][-2:], ["--", "state.json"])
-        self.assertEqual(commands[1][-2:], ["--", "state.json"])
-        for call in git.call_args_list:
-            self.assertEqual(Path(call.kwargs["cwd"]), ROOT)
-            self.assertEqual(call.kwargs["timeout"], 30)
+        self.assertEqual(len(fake.pushes), 2)
+        self.assertEqual(fake.pushes[0], fake.pushes[1])
+        self.assertEqual(fake.pushes[0], ["push", "--no-follow-tags", "--", "origin",
+                                         f"{fake.head}:refs/heads/main"])
+        commits = [args for args in fake.calls if "commit" in args]
+        self.assertEqual(len(commits), 1)
+        self.assertIn("--only", commits[0])
+        self.assertFalse(any(args[0] in {"add", "reset", "rebase", "fetch"} for args in fake.calls))
 
     def test_git_no_change_does_not_commit_or_push(self):
-        revision = "a" * 40
-        outputs = ["", "", "refs/heads/main\n",
-                   "refs/heads/main\0refs/remotes/origin/main\0origin\0refs/heads/main\n",
-                   revision + "\n", revision + "\n", "0\t0\n"]
-        with patch.object(subprocess, "run", side_effect=[
-                SimpleNamespace(returncode=0, stdout=value) for value in outputs]) as git:
+        from test_publish_retry import FakeGit
+        fake = FakeGit()
+        with patch.object(subprocess, "run", side_effect=fake):
             m.publish_state(m.STATE_FILE)
-        commands = [call.args[0] for call in git.call_args_list]
-        self.assertFalse(any("commit" in args or "push" in args for args in commands))
+        self.assertEqual(fake.commit_count, 0)
+        self.assertEqual(fake.pushes, [])
 
     def test_git_timeout_is_visible_without_command_output(self):
         with patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("secret-command", 30)), \

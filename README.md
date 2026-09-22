@@ -4,14 +4,15 @@ Upbit USDT와 KRX 금의 원화 가격을 환율·국제 금 시세와 비교하
 
 ## 실행
 
-Python 3.11 이상에서 `pip install -r requirements.txt`로 의존성을 설치합니다.
+Python 3.11/3.12의 전용 가상 환경을 사용합니다. Windows는 `python -m pip install --only-binary=:all: --require-hashes -r locks/runtime-windows.txt`, Linux는 `locks/runtime-linux.txt`로 설치합니다. 두 직접 의존성과 모든 전이 버전·배포 해시를 고정했습니다. `requirements.txt`도 같은 constraints를 적용하지만 해시 확인 설치에는 lock 명령을 사용합니다.
 
 | 명령 | 동작 |
 |---|---|
 | `python monitor.py` | 도움말만 출력. 환경변수·시세·상태를 읽거나 변경하지 않음 |
 | `python monitor.py --dry-run` | **실제 시세 API를 조회**하고 알림 후보를 출력. 발송·파일 저장·Git 작업 없음 |
 | `python monitor.py --live` | 실제 시세 조회, Telegram 발송, 로컬 `state.json` 저장. Git 작업 없음 |
-| `python monitor.py --live --publish-state` | 위 작업 후 상태 파일만 Git commit/push. GitHub Actions에서 명시적으로 사용 |
+| `python monitor.py --live --publish-state` | 위 작업 후 상태 파일만 Git commit/push. 로컬에서 명시적으로 선택 |
+| `python -B -S monitor.py --publish-only` | 이미 저장된 상태를 검증하고 Git 게시. 시세 조회·Telegram 발송·외부 패키지 import 없음 |
 
 `--state-file PATH`로 로컬 상태 경로를 지정할 수 있습니다. Git 게시에는 저장소의 기본 `state.json`만 사용할 수 있습니다. `.env`를 자동으로 읽지 않습니다. 예전의 옵션 없는 실행을 사용하던 외부 호출자는 위 실행 모드를 명시해야 합니다.
 
@@ -28,24 +29,34 @@ Python 3.11 이상에서 `pip install -r requirements.txt`로 의존성을 설�
 - 가격과 환율은 유한 양수로 검증하고, 국제 금은 기존 1,000~10,000 USD/oz 범위를 유지합니다. 계산 결과도 유한수여야 합니다. 잘못된 소스 값으로 경보를 해제하지 않습니다.
 - `health`에 소스별 정상 수집 시각, 연속 실패 횟수, 오류 유형을 저장하고 `run`에 전체/부분 실패를 기록합니다. 소스 하나가 실패해도 나머지는 처리하고 종료 코드는 1입니다.
 - **진단 알림 추가:** 테더·금은 연속 3회 실패부터, 공통 환율은 첫 실패부터 경고합니다. 경고가 전송 확인되면 해당 실패 기간에는 반복하지 않고, 정상 수집 후 새 실패 기간에서 다시 경고합니다. 전송 실패한 경고는 다음 실행에 재시도합니다. 3회는 실행 횟수이며 45분 보장은 아닙니다. 금융 임계값과는 별도 설정입니다.
-- 손상되거나 읽을 수 없는 상태는 신규 상태로 덮지 않고 보존한 채 실패합니다. 정상 JSON만 같은 폴더의 임시 파일에 기록·동기화한 후 원자 교체하며 NaN/Infinity는 저장하지 않습니다.
+- 손상되거나 읽을 수 없는 상태와 모든 깊이의 중복 JSON 키는 보존한 채 실패합니다. 정상 JSON을 같은 폴더에 기록·동기화한 후 후보 bytes/schema를 다시 확인하고 원자 교체합니다. NaN/Infinity는 저장하지 않으며 가격 저장값은 표시용 반올림으로 0이 되지 않습니다.
 
 ## 상태 Git 게시
 
-예약/수동 Actions는 같은 브랜치에서 직렬화하고, 대기 작업이 시작될 때 해당 브랜치를 체크아웃합니다. `add`, `diff`, `commit`, `push` 오류는 실행 실패로 드러납니다. commit 대상은 `state.json`으로 제한하고, push는 같은 커밋으로 1회만 재시도합니다. fetch/rebase/force-push로 다른 상태를 덮어쓰지 않습니다. 충돌은 실패로 남겨 검토합니다.
+예약/수동 Actions는 같은 브랜치에서 직렬화하고, 대기 작업이 시작될 때 해당 브랜치를 체크아웃합니다. checkout 자격은 남기지 않고 공개 wheel을 해시 확인 후 설치합니다. `--live` 수집·발송·저장과 별도의 `--publish-only` 게시 단계로 나눴습니다. 수집 또는 발송이 실패해도 저장된 실패 상태의 게시를 시도하며 앞 단계의 실패 종료는 유지합니다. 시작하지 않았거나 취소된 수집을 성공으로 표시하지 않습니다.
 
-commit 후 push가 실패한 상태에서 같은 파일의 게시를 다시 요청하면, 파일 차이가 없더라도 로컬 upstream과 미게시 이력을 확인합니다. upstream과 일치하면 게시를 생략하고, 미게시 이력이 모두 기존 봇 작성자·메시지 및 `state.json` 단일 파일 변경인 선형 커밋일 때만 확인한 커밋과 upstream 브랜치를 지정해 다시 push합니다. 사용자 커밋, upstream 누락, 뒤처짐·분기, 판정 오류는 실패로 남깁니다. 이 재시도는 로컬 ref를 확인하며 원격을 새로 fetch하지 않습니다. 원격에 새 변경이 있으면 일반 push 충돌로 실패할 수 있습니다. 변경 파일이 있어 새 상태 커밋을 만드는 기존 경로는 유지합니다.
+`KIMCHI_PUBLISH_TOKEN`은 Actions 게시 단계에만 전달합니다. 같은 GitHub 저장소의 정확한 push URL을 검증한 뒤 Git push 자식 환경에만 임시 인증 헤더를 넣으며 Git 설정 파일이나 명령 인자에 저장하지 않습니다. 게시 전용 경로는 기존 파일이 없거나 JSON이 잘못되면 Git 작업 전에 실패합니다.
+
+파일 변경 여부와 관계없이 commit 전에 attached branch·upstream·선행 커밋을 검증합니다. 미게시 이력은 봇 작성자·메시지 및 `state.json` 단일 변경인 선형 체인만 허용합니다. 이미 stage된 state는 보존하고 거절하며, 다른 파일의 stage는 그대로 둡니다. 새 `--only` commit의 부모·최종 체인도 재검사한 뒤 고정 SHA와 upstream ref를 지정하고 자동 tag 게시를 끈 일반 push만 최대 두 번 수행합니다. 사용자 커밋, upstream 누락, 뒤처짐·분기, 확인 중 변경은 실패로 남깁니다. reset/rebase/force로 제거하지 않습니다. 로컬 ref 확인 뒤 원격이 바뀌면 push 충돌로 실패할 수 있습니다.
 
 Telegram 전송과 Git 게시를 하나의 트랜잭션으로 묶을 수는 없습니다. 전송 후 저장·게시가 실패하거나 응답이 유실되면 다음 실행에서 중복 알림이 발생할 수 있습니다. 이 경우 상태 파일과 실패한 Actions 실행을 확인해야 합니다. `concurrency`는 정확한 실행 간격이나 모든 대기 실행의 보존을 보장하지 않습니다.
 
 ## 오프라인 회귀 검사
 
 ```bash
-python -I -m unittest discover -s tests -v
+python -B -S -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 외부 패키지를 설치하지 않아도 검사할 수 있습니다. 테스트는 합성 가격·임시 상태·가짜 Telegram/Git 응답만 사용하며 네트워크와 실제 Git 실행을 차단합니다. 저장소의 운영 `state.json`과 실제 환경변수·자격증명을 사용하지 않습니다. `--dry-run`은 실제 시세를 읽으므로 오프라인 테스트와 용도가 다릅니다.
 
 프로세스 잠금 검사는 별도의 Python 하위 프로세스로 합성 상태 경로만 잠가 경쟁·정상 종료·강제 종료 후 해제를 확인합니다. 모니터의 실제 조회·발송 명령을 실행하지 않습니다. `Offline tests` workflow는 main push와 pull request에서 Windows/Linux 및 Python 3.11/3.12로 같은 unittest를 실행합니다. 패키지 설치와 secrets 주입 없이 읽기 권한만 사용하며 checkout 자격증명을 저장하지 않습니다. 기존 예약 모니터 workflow와 실행 주기는 유지합니다.
 
-장외/휴일 시세의 신선도, 경계 왕복 알림의 해제 밴드, 스케줄 지연 감시는 별도 정책 작업으로 남아 있습니다.
+별도 `Dependency smoke` CI는 Windows/Linux × Python 3.11/3.12에서 자격 없이 고정 wheel을 설치하고 실제 native 패키지를 합성 메모리/시간대 입력으로 검사합니다. `scripts/dependency_smoke.py`의 `--self-check`, `--environment-check`, `--contract-check`는 실제 공급자·제품 실행 없이 동작합니다. 이 검사에는 `locks/dependency-smoke.txt`의 개발 환경을 사용합니다. Python I/O guard는 실수를 감지하는 경계이며 악의적인 native 코드에 대한 OS sandbox는 아닙니다.
+
+## 시세와 실행 시각 관측
+
+`run.price_evidence`는 실제 선택한 가격과 같은 응답에서 얻은 출처·수신시각·원천 시각 또는 날짜·정밀도·확인 불가 사유를 기록합니다. 확인된 계약만 해석합니다. Upbit UTC 체결일/시각, er-api의 갱신 epoch, Yahoo daily history의 선택 행 날짜를 사용하고, Naver·Swissquote·Yahoo fast_info의 미확인 시각은 unknown으로 남깁니다. 날짜를 임의 자정 체결시각으로 만들거나 별도 응답의 시각을 가격에 붙이지 않습니다. 과거 기록에 없던 증거를 새로 만들어 채우지 않습니다.
+
+`run.started_at/finished_at/duration_seconds`는 수집·판단·발송 구간의 시각과 monotonic 소요시간입니다(`finished_scope=collection_and_delivery`). 이후 파일 저장·Git 게시 완료 시각이나 전체 프로세스 성공을 뜻하지 않습니다. `health.last_success`는 정상 수집·계산 관측으로 원천 시세 시각과 구분합니다.
+
+`scheduled_start`와 `observed_interval_seconds`는 예약 실행 시작끼리의 관측입니다. 수동 실행·확인된 재실행은 예약 기준을 덮지 않습니다. 실제 예정 슬롯 증거가 없으므로 `schedule_delay_seconds`는 null이며 간격만으로 누락 횟수를 단정하지 않습니다. 시간대 없는 기존 시각은 OS 지역으로 추정하지 않습니다. 장외/휴일 시세 허용, 임계값·해제 밴드·금 레벨 기억·15분 cron은 그대로이고 실제 1주 운영 관측 및 분산 발송/저장 원자성은 별도 잔여입니다.

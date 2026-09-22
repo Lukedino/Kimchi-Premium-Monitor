@@ -1,0 +1,43 @@
+name: Dependency smoke
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-smoke-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install public locked wheels without credentials
+        run: >-
+          python -I -m pip --isolated install --index-url https://pypi.org/simple
+          --only-binary=:all: --require-hashes -r locks/dependency-smoke.txt
+      - name: Check installed dependency compatibility
+        run: python -I -m pip --isolated check
+      - name: Check accidental I/O guards
+        run: python -I -S -B -X utf8 scripts/dependency_smoke.py --self-check
+      - name: Check actual packages without providers
+        run: python -I -S -B -X utf8 scripts/dependency_smoke.py --environment-check
+      - name: Check workflow and lock safety contracts
+        run: python -I -S -B -X utf8 scripts/dependency_smoke.py --contract-check

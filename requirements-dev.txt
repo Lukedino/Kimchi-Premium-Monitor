@@ -1,0 +1,3 @@
+-r requirements.txt
+# 격리 검사에서는 OS zoneinfo 대신 동일한 공개 시간대 패키지를 사용한다.
+tzdata==2026.4

@@ -20,7 +20,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
           ref: ${{ github.ref_name }}
 
       - name: Setup Python
@@ -29,9 +29,12 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: >-
+          python -I -m pip --isolated install --index-url https://pypi.org/simple
+          --only-binary=:all: --require-hashes -r locks/runtime-linux.txt
 
       - name: Run monitor
+        id: monitor
         env:
           RUN_MODE: ${{ github.event_name }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
@@ -40,4 +43,10 @@ jobs:
           USDT_KIMP_HIGH: ${{ vars.USDT_KIMP_HIGH }}
           GOLD_KIMP_LOW: ${{ vars.GOLD_KIMP_LOW }}
           GOLD_KIMP_HIGH: ${{ vars.GOLD_KIMP_HIGH }}
-        run: python monitor.py --live --publish-state
+        run: python -B monitor.py --live
+
+      - name: Publish saved state even after a collection or delivery failure
+        if: ${{ always() && (steps.monitor.outcome == 'success' || steps.monitor.outcome == 'failure') }}
+        env:
+          KIMCHI_PUBLISH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python -B -S monitor.py --publish-only

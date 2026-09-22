@@ -13,10 +13,14 @@ import json
 import re
 import math
 import argparse
+import base64
 import subprocess
 import tempfile
+import time
 from datetime import datetime, timezone, timedelta
 from state_lock import StateLockError, state_execution_lock
+from quote_evidence import Quote, capture_quote
+from run_timing import start_run
 
 # ─── 상수 ───────────────────────────────────────────────
 KST = timezone(timedelta(hours=9))
@@ -88,6 +92,15 @@ class StateError(RuntimeError):
     """State could not be loaded, persisted, or published safely."""
 
 
+def _unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate state key")
+        result[key] = value
+    return result
+
+
 def validate_state(state: dict):
     if not isinstance(state, dict):
         raise ValueError("state must be an object")
@@ -122,13 +135,15 @@ def validate_state(state: dict):
                 datetime.fromisoformat(entry[name])
 
 
-def load_state(state_file=None) -> dict:
+def load_state(state_file=None, *, required=False) -> dict:
     path = state_file or STATE_FILE
     try:
         with open(path, "r", encoding="utf-8") as f:
-            state = json.load(f)
+            state = json.load(f, object_pairs_hook=_unique_object)
         validate_state(state)
     except FileNotFoundError:
+        if required:
+            raise StateError("saved state is missing; publication refused") from None
         print("  [State] 신규 생성")
         return {"history": [], "last_alert": {}}
     except (OSError, ValueError, TypeError, OverflowError) as e:
@@ -143,12 +158,34 @@ def publish_state(state_file):
     expected_path = os.path.normcase(os.path.realpath(os.path.join(directory, "state.json")))
     if actual != expected_path:
         raise StateError("only the repository state.json can be published")
+    credential_url = None
 
     def git(*args, allowed=(0,), output=False):
-        operation = "commit" if "commit" in args else args[0]
+        operation = args[4] if args[0] == "-c" else args[0]
+        options = {}
+        token = os.environ.get("KIMCHI_PUBLISH_TOKEN")
+        if token:
+            repository = os.environ.get("GITHUB_REPOSITORY", "")
+            if (os.environ.get("GITHUB_ACTIONS") != "true" or
+                    os.environ.get("GITHUB_SERVER_URL") != "https://github.com" or
+                    not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository)):
+                raise StateError("publication credential context invalid")
+            child_env = dict(os.environ)
+            child_env.pop("KIMCHI_PUBLISH_TOKEN", None)
+            if operation == "push":
+                if credential_url is None:
+                    raise StateError("publication credential target unverified")
+                basic = base64.b64encode(("x-access-token:" + token).encode("utf-8")).decode("ascii")
+                child_env.update(GIT_CONFIG_COUNT="2", GIT_CONFIG_KEY_0="credential.helper",
+                                 GIT_CONFIG_VALUE_0="", GIT_CONFIG_KEY_1=(
+                                     "http." + credential_url + ".extraheader"),
+                                 GIT_CONFIG_VALUE_1="AUTHORIZATION: basic " + basic,
+                                 GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+            options["env"] = child_env
         try:
             result = subprocess.run(
                 ["git", *args], cwd=directory, capture_output=True, text=True, timeout=30,
+                **options,
             )
         except (OSError, UnicodeError, subprocess.TimeoutExpired) as e:
             raise StateError(f"git {operation} failed ({type(e).__name__})") from None
@@ -160,10 +197,7 @@ def publish_state(state_file):
             return result.stdout
         return result.returncode
 
-    git("add", "--", "state.json")
-    changed = git("diff", "--cached", "--quiet", "--", "state.json", allowed=(0, 1))
-    push_args = ("push",)
-    if changed == 0:
+    def context():
         # A previous commit may have succeeded while both pushes failed. Query
         # only local refs; uncertainty is an error, never evidence of publication.
         branch = git("symbolic-ref", "--quiet", "HEAD", output=True).strip()
@@ -201,8 +235,7 @@ def publish_state(state_file):
         if not ahead:
             if head != base:
                 raise StateError("state publication revision/count mismatch")
-            print("  [State] 변경사항·미게시 커밋 없음 — push 생략")
-            return
+            return branch, upstream, remote, remote_ref, base, head, ahead
 
         commits = git("rev-list", "--reverse", f"{base}..{head}", output=True).splitlines()
         if len(commits) != ahead or not commits or commits[-1] != head:
@@ -222,12 +255,43 @@ def publish_state(state_file):
             if names != "state.json\0":
                 raise StateError("pending history is not exclusively state.json changes")
             previous = commit
-        # Freeze the verified tip and target. push.default, remote push refspecs
-        # and automatic tag following must not publish unrelated user work.
-        push_args = ("push", "--no-follow-tags", "--", remote, f"{head}:{remote_ref}")
-    else:
+        return branch, upstream, remote, remote_ref, base, head, ahead
+
+    before = context()
+    if os.environ.get("KIMCHI_PUBLISH_TOKEN"):
+        expected_url = "https://github.com/" + os.environ["GITHUB_REPOSITORY"]
+        remote_urls = git("remote", "get-url", "--push", "--all", before[2], output=True).splitlines()
+        if len(remote_urls) != 1 or remote_urls[0] not in {expected_url, expected_url + ".git"}:
+            raise StateError("publication credential target invalid")
+        credential_url = remote_urls[0]
+    # Never stage over user work. --only commits the selected worktree path and
+    # leaves unrelated index entries in place; already staged state is ambiguous.
+    if git("diff", "--cached", "--quiet", "--", "state.json", allowed=(0, 1)):
+        raise StateError("state.json already has staged changes; index preserved")
+    git("ls-files", "--error-unmatch", "--", "state.json")
+    changed = git("diff", "--quiet", "HEAD", "--", "state.json", allowed=(0, 1))
+    if changed:
+        if context() != before:
+            raise StateError("state publication context changed before commit")
         git("-c", "user.name=kimp-bot", "-c", "user.email=bot@kimp-monitor",
             "commit", "--only", "-m", "update state [skip ci]", "--", "state.json")
+        after = context()
+        if after[:5] != before[:5] or after[6] != before[6] + 1:
+            raise StateError("state publication context changed during commit")
+        if git("show", "-s", "--format=%P", after[5], output=True).strip() != before[5]:
+            raise StateError("state publication commit parent changed")
+        # context() validates the entire linear state-only chain including this
+        # new commit. A concurrent unrelated commit prevents publication.
+        head, ahead = after[5:]
+    else:
+        head, ahead = before[5:]
+    if not ahead:
+        print("  [State] 변경사항·미게시 커밋 없음 — push 생략")
+        return
+    # Freeze the verified tip and target for both changed and retry-only paths.
+    # Ignore push.default, configured push refspecs and automatic tag following.
+    remote, remote_ref = before[2:4]
+    push_args = ("push", "--no-follow-tags", "--", remote, f"{head}:{remote_ref}")
     # Retry the same push once; never fetch/rebase/force over competing state.
     for attempt in range(2):
         try:
@@ -246,12 +310,17 @@ def save_state(state: dict, *, publish=False, state_file=None):
     try:
         validate_state(state)
         payload = json.dumps(state, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=os.path.dirname(path),
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="\n", dir=os.path.dirname(path),
                                          prefix=".state-", suffix=".tmp", delete=False) as f:
             temporary = f.name
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
+        with open(temporary, "rb") as candidate_file:
+            candidate = candidate_file.read()
+        if candidate != payload.encode("utf-8"):
+            raise ValueError("state candidate bytes differ")
+        validate_state(json.loads(candidate, object_pairs_hook=_unique_object))
         os.replace(temporary, path)
         temporary = None
         print("  [State] 파일 저장 완료")
@@ -278,9 +347,9 @@ def add_history(state: dict, usdt_kimp, gold_kimp, now: datetime,
         "time":            now.isoformat(),
         "usdt_kimp":       round(usdt_kimp, 4) if usdt_kimp is not None else None,
         "gold_kimp":       round(gold_kimp, 4) if gold_kimp is not None else None,
-        "usd_krw":         round(usd_krw, 2) if usd_krw is not None else None,
-        "intl_gold_usd_oz": round(intl_gold_usd_oz, 2) if intl_gold_usd_oz is not None else None,
-        "krx_gold_krw_g":  round(krx_gold_krw_g, 0) if krx_gold_krw_g is not None else None,
+        "usd_krw":         usd_krw,
+        "intl_gold_usd_oz": intl_gold_usd_oz,
+        "krx_gold_krw_g":  krx_gold_krw_g,
     }
     state.setdefault("history", []).append(entry)
     if len(state["history"]) > MAX_HISTORY:
@@ -434,6 +503,7 @@ def analyze_gold_kimp_driver(
     current_usd_krw: float,
     current_intl_gold_oz: float,
     current_krx_gold_g: float,
+    *, now=None,
 ) -> str:
     """
     금 김프 변동의 주요 원인을 분석합니다.
@@ -487,7 +557,7 @@ def analyze_gold_kimp_driver(
     if prev_time:
         try:
             prev_dt = datetime.fromisoformat(prev_time)
-            now_dt = datetime.now(KST)
+            now_dt = now if now is not None else datetime.now(KST)
             delta = now_dt - prev_dt
             hours = delta.total_seconds() / 3600
             if hours < 1:
@@ -579,18 +649,30 @@ def analyze_gold_kimp_driver(
 #  데이터 수집 (기존과 동일 — 변경 없음)
 # ═══════════════════════════════════════════════════════
 
-def get_upbit_usdt_price() -> float:
+def _utc_now():
+    return datetime.now(timezone.utc)
+
+
+def _price_evidence(value, source, *, enabled, received_at, response=None, history_index=None):
+    if not enabled:
+        return value
+    return capture_quote(value, source, fetched_at=received_at, response=response, history_index=history_index)
+
+
+def get_upbit_usdt_price(*, with_evidence=False, clock=_utc_now):
     url     = "https://api.upbit.com/v1/ticker"
     params  = {"markets": "KRW-USDT"}
     headers = {"Accept": "application/json"}
     resp    = _requests().get(url, params=params, headers=headers, timeout=10)
     resp.raise_for_status()
-    price = valid_number(resp.json()[0]["trade_price"], "Upbit KRW/USDT", positive=True)
+    item = resp.json()[0]
+    received_at = clock()
+    price = valid_number(item["trade_price"], "Upbit KRW/USDT", positive=True)
     print(f"  [Upbit] USDT/KRW = {price:,.2f}")
-    return price
+    return _price_evidence(price, "upbit", enabled=with_evidence, received_at=received_at, response=item)
 
 
-def get_usd_krw_rate() -> float:
+def get_usd_krw_rate(*, with_evidence=False, clock=_utc_now):
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -598,7 +680,7 @@ def get_usd_krw_rate() -> float:
             "Chrome/120.0.0.0 Safari/537.36"
         )
     }
-    today_kst = datetime.now(KST).strftime("%Y-%m-%d")
+    today_kst = clock().astimezone(KST).strftime("%Y-%m-%d")
 
     try:
         url  = (
@@ -608,6 +690,7 @@ def get_usd_krw_rate() -> float:
         resp = _requests().get(url, headers=headers, timeout=10)
         resp.raise_for_status()
         data = resp.json()
+        received_at = clock()
 
         if data.get("isSuccess") and data.get("result"):
             item      = data["result"][0]
@@ -621,35 +704,38 @@ def get_usd_krw_rate() -> float:
                     f"  [Naver] USD/KRW = {rate:,.2f}"
                     f"  (최근 거래일 {traded_at} — 오늘 {today_kst}, 주말/공휴일 허용)"
                 )
-            return rate
+            return _price_evidence(rate, "naver_fx", enabled=with_evidence, received_at=received_at, response=item)
     except Exception as e:
-        print(f"  [Naver] 환율 API 실패: {e}")
+        print(f"  [Naver] 환율 API 실패: {type(e).__name__}")
 
     try:
         print("  [Yahoo] 폴백: KRW=X 시도...")
         ticker = _ticker("KRW=X")
         rate   = valid_number(ticker.fast_info.last_price, "Yahoo KRW/USD", positive=True)
+        received_at = clock()
         print(f"  [Yahoo] USD/KRW = {rate:,.2f}")
-        return rate
+        return _price_evidence(rate, "yahoo_fx_fast_info", enabled=with_evidence, received_at=received_at)
     except Exception as e:
-        print(f"  [Yahoo] 환율 실패: {e}")
+        print(f"  [Yahoo] 환율 실패: {type(e).__name__}")
 
     try:
         print("  [er-api] 폴백: 일간 환율 시도...")
         resp = _requests().get("https://open.er-api.com/v6/latest/USD", timeout=10)
         resp.raise_for_status()
-        rate = valid_number(resp.json()["rates"]["KRW"], "er-api KRW/USD", positive=True)
+        data = resp.json()
+        received_at = clock()
+        rate = valid_number(data["rates"]["KRW"], "er-api KRW/USD", positive=True)
         print(f"  [er-api] USD/KRW = {rate:,.2f}  (주의: 일간 업데이트)")
-        return rate
+        return _price_evidence(rate, "er_api", enabled=with_evidence, received_at=received_at, response=data)
     except Exception as e:
-        print(f"  [er-api] 환율 실패: {e}")
+        print(f"  [er-api] 환율 실패: {type(e).__name__}")
 
     raise RuntimeError(
         "USD/KRW 환율을 가져올 수 있는 모든 소스(네이버·야후·er-api)가 응답하지 않습니다."
     )
 
 
-def get_krx_gold_price_per_gram() -> float:
+def get_krx_gold_price_per_gram(*, with_evidence=False, clock=_utc_now):
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -663,35 +749,38 @@ def get_krx_gold_price_per_gram() -> float:
         resp = _requests().get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         data  = resp.json()
+        received_at = clock()
         price = valid_number(data["closePrice"].replace(",", ""), "KRX KRW/g", positive=True)
         print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g  (네이버 API)")
-        return price
+        return _price_evidence(price, "naver_krx_api", enabled=with_evidence, received_at=received_at, response=data)
     except Exception as e:
-        print(f"  [KRX Gold] 네이버 API 실패: {e}")
+        print(f"  [KRX Gold] 네이버 API 실패: {type(e).__name__}")
 
     try:
         url  = "https://finance.naver.com/marketindex/goldDetail.naver"
         resp = _requests().get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         text = resp.text
+        received_at = clock()
         for pattern in [r"([\d,]+\.\d+)\s*원/g", r"([\d,]+)\s*원/g"]:
             match = re.search(pattern, text)
             if match:
                 price = valid_number(match.group(1).replace(",", ""), "KRX KRW/g", positive=True)
                 print(f"  [KRX Gold] 국내 금현물 = {price:,.0f} 원/g  (데스크톱 파싱)")
-                return price
+                return _price_evidence(price, "naver_krx_html", enabled=with_evidence, received_at=received_at)
     except Exception as e:
-        print(f"  [KRX Gold] 데스크톱 파싱 실패: {e}")
+        print(f"  [KRX Gold] 데스크톱 파싱 실패: {type(e).__name__}")
 
     raise RuntimeError("KRX 금현물 가격을 파싱할 수 없습니다.")
 
 
-def get_international_gold_usd_per_oz() -> float:
+def get_international_gold_usd_per_oz(*, with_evidence=False, clock=_utc_now):
     try:
         url  = "https://forex-data-feed.swissquote.com/public-quotes/bboquotes/instrument/XAU/USD"
         resp = _requests().get(url, timeout=10)
         resp.raise_for_status()
         data   = resp.json()
+        received_at = clock()
         prices = data[0]["spreadProfilePrices"][0]
         bid    = valid_number(prices["bid"], "gold bid USD/oz", positive=True)
         ask    = valid_number(prices["ask"], "gold ask USD/oz", positive=True)
@@ -706,28 +795,40 @@ def get_international_gold_usd_per_oz() -> float:
             )
 
         print(f"  [Swissquote] XAU/USD = ${spot:,.2f}/oz  (bid ${bid:,.2f} / ask ${ask:,.2f})")
-        return spot
+        return _price_evidence(spot, "swissquote", enabled=with_evidence, received_at=received_at, response=data)
     except Exception as e:
-        print(f"  [Swissquote] 실패: {e}")
+        print(f"  [Swissquote] 실패: {type(e).__name__}")
 
     try:
         print("  [Yahoo] 폴백: GC=F 금 선물 시도...")
         ticker = _ticker("GC=F")
+        source, history_index = "yahoo_gold_fast_info", None
         try:
             price = valid_gold_price(ticker.fast_info.last_price)
+            received_at = clock()
         except Exception:
             hist = ticker.history(period="1d")
+            received_at = clock()
             if hist.empty:
                 raise RuntimeError("yfinance 히스토리 데이터 없음")
             price = valid_gold_price(hist["Close"].iloc[-1])
+            source = "yahoo_gold_history"
+            # Synthetic/legacy adapters may lack an index; retain unknown time.
+            if with_evidence:
+                try:
+                    index = getattr(hist, "index", None)
+                    history_index = index[-1] if index is not None else None
+                except Exception:
+                    history_index = None
 
         if not (GOLD_PRICE_MIN_USD < price < GOLD_PRICE_MAX_USD):
             raise ValueError(f"비정상 금값 감지: ${price:,.2f}/oz")
 
         print(f"  [Yahoo] 국제 금 선물 = ${price:,.2f}/oz")
-        return price
+        return _price_evidence(price, source, enabled=with_evidence, received_at=received_at,
+                               history_index=history_index)
     except Exception as e:
-        print(f"  [Yahoo] 금 선물 실패: {e}")
+        print(f"  [Yahoo] 금 선물 실패: {type(e).__name__}")
 
     raise RuntimeError("국제 금 시세를 가져올 수 없습니다.")
 
@@ -808,7 +909,8 @@ def record_source_result(state, source, now, error=None):
 
 
 def finish_run(state, now, failed_sources, failed_alerts, *, send_alerts,
-               persist_state, publish, state_file):
+               persist_state, publish, state_file, timing=None, clock=_utc_now,
+               monotonic_clock=time.monotonic, quotes=None):
     for source in failed_sources:
         health = state["health"][source]
         threshold = 1 if source == "fx" else SOURCE_FAILURE_ALERT_AFTER
@@ -817,7 +919,7 @@ def finish_run(state, now, failed_sources, failed_alerts, *, send_alerts,
                        f"({health['consecutive_failures']}회 연속, {health['error_type']})")
             if send_alerts:
                 if send_telegram(warning):
-                    health["last_warning"] = now.isoformat()
+                    health["last_warning"] = clock().isoformat()
                 else:
                     failed_alerts += 1
             else:
@@ -827,6 +929,16 @@ def finish_run(state, now, failed_sources, failed_alerts, *, send_alerts,
         status = "failed" if "fx" in failed_sources or len(failed_sources) == 2 else "partial_failure"
     state["run"] = {"time": now.isoformat(), "status": status,
                     "failed_sources": list(failed_sources), "failed_alerts": failed_alerts}
+    if timing is not None:
+        state["run"].update(timing_version=1, **timing.finish(
+            finished_at=clock(), monotonic_finished=monotonic_clock()))
+        state["run"]["price_evidence"] = quotes or {}
+        baseline = timing.next_scheduled_start
+        if baseline is not None:
+            state["scheduled_start"] = baseline
+        # This duration covers collection and delivery. State/Git persistence is
+        # subsequent, so do not label it total process or successful publication.
+        state["run"]["finished_scope"] = "collection_and_delivery"
     if persist_state:
         try:
             save_state(state, publish=publish, state_file=state_file)
@@ -840,9 +952,11 @@ def finish_run(state, now, failed_sources, failed_alerts, *, send_alerts,
 
 
 def run_monitor(*, send_alerts=False, persist_state=False, publish=False,
-                state_file=None, run_mode="", now=None):
+                state_file=None, run_mode="", now=None, clock=None,
+                monotonic_clock=time.monotonic, run_id=None, run_attempt=None):
     options = dict(send_alerts=send_alerts, persist_state=persist_state, publish=publish,
-                   state_file=state_file, run_mode=run_mode, now=now)
+                   state_file=state_file, run_mode=run_mode, now=now, clock=clock,
+                   monotonic_clock=monotonic_clock, run_id=run_id, run_attempt=run_attempt)
     if not (send_alerts or persist_state or publish):
         return _run_monitor(**options)
     try:
@@ -856,8 +970,16 @@ def run_monitor(*, send_alerts=False, persist_state=False, publish=False,
 
 
 def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
-                 state_file=None, run_mode="", now=None):
-    now = now or datetime.now(KST)
+                 state_file=None, run_mode="", now=None, clock=None,
+                 monotonic_clock=time.monotonic, run_id=None, run_attempt=None):
+    # A supplied legacy now remains a deterministic fake clock for callers/tests.
+    clock = clock or ((lambda: now) if now is not None else _utc_now)
+    started_at, monotonic_started = clock(), monotonic_clock()
+    for stamp in (started_at, now if now is not None else started_at):
+        if not isinstance(stamp, datetime) or stamp.tzinfo is None or stamp.utcoffset() is None:
+            print("  [Clock] aware timestamp required")
+            return 1
+    now = (now or started_at).astimezone(KST)
     print(f"\n{'='*57}")
     print(f"  김치프리미엄 모니터  |  {now.strftime('%Y-%m-%d %H:%M:%S KST')}")
     print(f"  테더: 방향성 알림  |  금: 단계별 알림 ({GOLD_KIMP_STEP}%p 간격)")
@@ -872,24 +994,39 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
         return 1
     alerts = []
     failed_sources = []
+    quotes = {}
+    timing = start_run(run_mode, started_at=started_at, monotonic_started=monotonic_started,
+                       previous_scheduled_start=state.get("scheduled_start"),
+                       run_id=run_id, run_attempt=run_attempt)
+
+    def observed_price(reader, label, key):
+        quote = reader(with_evidence=True, clock=clock)
+        value = valid_number(quote, label, positive=True)
+        if isinstance(quote, Quote):
+            quotes[key] = quote.to_dict()
+        return value
+
+    def finish(failed, delivery_failures):
+        return finish_run(state, now, failed, delivery_failures, send_alerts=send_alerts,
+                          persist_state=persist_state, publish=publish, state_file=state_file,
+                          timing=timing, clock=clock, monotonic_clock=monotonic_clock, quotes=quotes)
 
     # ── 1. USD/KRW 환율 ─────────────────────────────────
     print("\n[1] USD/KRW 환율 조회")
     try:
-        usd_krw = valid_number(get_usd_krw_rate(), "KRW/USD", positive=True)
-        record_source_result(state, "fx", now)
+        usd_krw = observed_price(get_usd_krw_rate, "KRW/USD", "fx")
+        record_source_result(state, "fx", clock())
     except Exception as e:
         print(f"❌ USD/KRW 환율 조회 실패: {type(e).__name__}")
-        record_source_result(state, "fx", now, e)
-        return finish_run(state, now, ["fx"], 0, send_alerts=send_alerts,
-                          persist_state=persist_state, publish=publish, state_file=state_file)
+        record_source_result(state, "fx", clock(), e)
+        return finish(["fx"], 0)
 
     # ── 2. 테더 김프 (기존 로직 유지) ───────────────────
     print("\n[2] 테더 김프 계산")
     usdt_kimp  = None
     upbit_usdt = None
     try:
-        upbit_usdt = valid_number(get_upbit_usdt_price(), "KRW/USDT", positive=True)
+        upbit_usdt = observed_price(get_upbit_usdt_price, "KRW/USDT", "usdt")
         usdt_kimp  = calc_usdt_kimp(upbit_usdt, usd_krw)
         print(f"  ▶ 테더 김프 = {usdt_kimp:+.2f}%")
 
@@ -927,12 +1064,12 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
                 la.pop("usdt_high", None)
                 print("  [State] 테더 정상 복귀 → 상태 초기화")
 
-        record_source_result(state, "usdt", now)
+        record_source_result(state, "usdt", clock())
 
     except Exception as e:
         usdt_kimp = upbit_usdt = None
         failed_sources.append("usdt")
-        record_source_result(state, "usdt", now, e)
+        record_source_result(state, "usdt", clock(), e)
         print(f"  ⚠ 테더 김프 계산 실패: {type(e).__name__}")
 
     # ── 3. 금 김프 (★ 단계별 알림 + 원인 분석) ────────
@@ -942,8 +1079,9 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
     intl_gold_oz    = None
     intl_gold_krw_g = None
     try:
-        krx_gold                   = valid_number(get_krx_gold_price_per_gram(), "KRX KRW/g", positive=True)
-        intl_gold_oz               = valid_gold_price(get_international_gold_usd_per_oz())
+        krx_gold = observed_price(get_krx_gold_price_per_gram, "KRX KRW/g", "krx_gold")
+        intl_gold_oz = valid_gold_price(observed_price(get_international_gold_usd_per_oz,
+                                                      "gold USD/oz", "international_gold"))
         gold_kimp, intl_gold_krw_g = calc_gold_kimp(krx_gold, intl_gold_oz, usd_krw)
 
         print(f"  ▶ 금 김프 = {gold_kimp:+.2f}%")
@@ -952,7 +1090,7 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
 
         # 원인 분석 (알림 여부와 무관하게 항상 수행)
         driver_analysis = analyze_gold_kimp_driver(
-            state, usd_krw, intl_gold_oz, krx_gold
+            state, usd_krw, intl_gold_oz, krx_gold, now=now
         )
         print(f"  {driver_analysis}")
 
@@ -974,9 +1112,9 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
                 alerts.append((
                     alert_msg, "gold_low", gold_kimp, step_level,
                     {
-                        "usd_krw": round(usd_krw, 2),
-                        "intl_gold_usd_oz": round(intl_gold_oz, 2),
-                        "krx_gold_krw_g": round(krx_gold, 0),
+                        "usd_krw": usd_krw,
+                        "intl_gold_usd_oz": intl_gold_oz,
+                        "krx_gold_krw_g": krx_gold,
                     }
                 ))
             state.get("last_alert", {}).pop("gold_high", None)
@@ -999,9 +1137,9 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
                 alerts.append((
                     alert_msg, "gold_high", gold_kimp, step_level,
                     {
-                        "usd_krw": round(usd_krw, 2),
-                        "intl_gold_usd_oz": round(intl_gold_oz, 2),
-                        "krx_gold_krw_g": round(krx_gold, 0),
+                        "usd_krw": usd_krw,
+                        "intl_gold_usd_oz": intl_gold_oz,
+                        "krx_gold_krw_g": krx_gold,
                     }
                 ))
             state.get("last_alert", {}).pop("gold_low", None)
@@ -1014,12 +1152,12 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
                 la.pop("gold_high", None)
                 print("  [State] 금 김프 정상 복귀 → 상태 초기화")
 
-        record_source_result(state, "gold", now)
+        record_source_result(state, "gold", clock())
 
     except Exception as e:
         gold_kimp = krx_gold = intl_gold_oz = intl_gold_krw_g = None
         failed_sources.append("gold")
-        record_source_result(state, "gold", now, e)
+        record_source_result(state, "gold", clock(), e)
         print(f"  ⚠ 금 김프 계산 실패: {type(e).__name__}")
 
     # ── 이력 기록 (환율/금값 포함) ───────────────────────
@@ -1096,11 +1234,10 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
 
     # ── 7. 상태 저장 ────────────────────────────────────
     print("\n[5] 상태 저장")
-    result = finish_run(state, now, failed_sources, failed_alerts, send_alerts=send_alerts,
-                        persist_state=persist_state, publish=publish, state_file=state_file)
+    result = finish(failed_sources, failed_alerts)
 
     print(f"\n{'='*57}")
-    print(f"  완료  |  {datetime.now(KST).strftime('%H:%M:%S KST')}")
+    print(f"  완료  |  {clock().astimezone(KST).strftime('%H:%M:%S KST')}")
     print(f"{'='*57}\n")
     return result
 
@@ -1110,11 +1247,24 @@ def main(argv=None, *, environ=None):
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--live", action="store_true", help="시세 조회, 알림 전송, 상태 저장")
     mode.add_argument("--dry-run", action="store_true", help="시세 조회만 실행; 알림/저장/Git 없음")
+    mode.add_argument("--publish-only", action="store_true", help="검증한 기존 저장 상태만 Git 게시; 시세/발송 없음")
     parser.add_argument("--publish-state", action="store_true", help="--live 상태를 Git commit/push (명시적 선택)")
     parser.add_argument("--state-file", default=STATE_FILE, help="로컬 상태 파일 경로")
     args = parser.parse_args(argv)
     if args.publish_state and (not args.live or os.path.abspath(args.state_file) != STATE_FILE):
         parser.error("--publish-state requires --live and the repository state.json")
+    if args.publish_only:
+        if os.path.abspath(args.state_file) != STATE_FILE:
+            parser.error("--publish-only requires the repository state.json")
+        try:
+            with state_execution_lock(STATE_FILE) as canonical_state:
+                # Validate locally saved state before making a commit or push.
+                load_state(canonical_state, required=True)
+                publish_state(canonical_state)
+            return 0
+        except (StateError, StateLockError) as error:
+            print(f"  [State] {error}")
+            return 1
     if not args.live and not args.dry_run:
         parser.print_help()
         return 0
@@ -1125,7 +1275,8 @@ def main(argv=None, *, environ=None):
         print(f"  [Config] {error}")
         return 1
     return run_monitor(send_alerts=args.live, persist_state=args.live, publish=args.publish_state,
-                       state_file=args.state_file, run_mode=environ.get("RUN_MODE") or "")
+                       state_file=args.state_file, run_mode=environ.get("RUN_MODE") or "",
+                       run_id=environ.get("GITHUB_RUN_ID"), run_attempt=environ.get("GITHUB_RUN_ATTEMPT"))
 
 
 if __name__ == "__main__":

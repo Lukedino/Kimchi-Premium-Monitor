@@ -2,6 +2,15 @@
 
 > 2026-09-22 후속: 아래 읽기 전용 역할·파일 현황·무옵션 실행 설명은 초기 진단 당시 기록이다. 이후 사용자의 수정 및 검증 후 push 승인으로 개선을 반영했다. 현재 실행 모드, 상태 보존, 로컬 실행 잠금, 게시 재시도와 오프라인 검사는 README.md를 따른다. 실제 운영 상태·자격증명·금융 정책은 별도 승인 범위를 지킨다.
 
+> 2026-09-22 Q9: 사용자 ‘잔여 결함 수정까지 일괄 진행 — 거래·전략 정책 변경 제외’ 및 중간 commit/push 승인으로 게시/JSON/시각 증거/고정 환경을 보완했다. 현재 계약은 아래 최신 절과 README가 우선한다. 운영 state 본문·자격은 검증 입력에 넣지 않는다.
+
+## Q9 유지할 계약
+
+- 게시 전 branch/upstream/봇 전용 선형 이력과 새 commit 부모를 검증한다. 사용자 index·커밋을 reset/rebase/force로 없애지 않는다. 고정 SHA/refspec의 일반 push만 최대2회다. JSON 중복키·비유한 값·후보 bytes 불일치를 거절하며 보관 가격을 반올림해0으로 바꾸지 않는다.
+- Actions는 공개 hash/wheel 설치 및 `--live` 조회/발송/저장 후 별도 `--publish-only`를 실행한다. publish-only는 기존 상태를 잠금 안에서 엄격 검증하고 stdlib만 import한다. token은 이 단계에만 전달하고 검증한 저장소 push URL용 Git 자식 환경에만 넣는다. 수집 실패 뒤의 저장된 진단 상태 게시가 원래 실패 종료를 덮어쓰지 않는다.
+- `quote_evidence.py`는 가격과 같은 응답의 확인된 계약만 시간 증거로 사용한다. 미확인/미래/naive metadata는 가격 판단 정책을 새로 바꾸지 않는다. `run_timing.py`는 aware wall clock·monotonic을 분리하고 수동/재실행의 예약 baseline을 보존한다. 완료 시각은 저장/게시 전 수집·발송 구간이며 예정 슬롯 없이는 지연값을 만들지 않는다.
+- stdlib 오프라인 CI와 실제 고정 패키지 native CI를 분리한다. 실제 state/.env/provider/Telegram/Git 원격은 시험 입력이 아니다. 새 price freshness·장외/휴일·금 level/해제밴드·cron 정책 및 실제 운영 dispatch는 이 코드 검증에 포함하지 않는다.
+
 # AGENTS.md — Kimchi-Premium-Monitor
 
 ## 1. 요약
