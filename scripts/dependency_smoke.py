@@ -29,6 +29,21 @@ SOURCES = (
     ".github/workflows/dependency-smoke.yml", "tests/test_dependency_contract.py",
 )
 
+FAILURE_CODES = frozenset({
+    "PACKAGE_MISMATCH", "UNLOCKED_PACKAGE", "REQUEST_PREPARATION_FAILED",
+    "CERTIFI_TRUST_EMPTY", "CFFI_MEMORY_MISMATCH", "DATAFRAME_RESULT_MISMATCH",
+    "NONFINITE_RESULT_MISMATCH", "SYSTEM_TZPATH_ACTIVE", "ZONEINFO_OFFSET_MISMATCH",
+    "PANDAS_OFFSET_MISMATCH", "LXML_PARSE_MISMATCH", "BS4_PARSE_MISMATCH",
+    "PROTOBUF_ROUNDTRIP_MISMATCH", "SQLITE_ROUNDTRIP_MISMATCH",
+    "GUARD_NOT_ENFORCED", "GUARD_COUNT_MISMATCH", "ALLOWED_TEMP_ROUNDTRIP_MISMATCH",
+})
+
+
+def failure_code(error):
+    """이미 코드에 정의한 진단만 공개한다. 임의 예외 문자열은 출력하지 않는다."""
+    message = error.args[0] if isinstance(error, AssertionError) and error.args else None
+    return message if isinstance(message, str) and message in FAILURE_CODES else "UNCLASSIFIED_FAILURE"
+
 
 def inside(path, root):
     try:
@@ -87,7 +102,14 @@ def child(config_path):
         blocked[code] += 1
         if code not in locations:
             frame = sys._getframe(2)
-            locations[code] = Path(frame.f_code.co_filename).name + ":" + frame.f_code.co_name
+            stack = []
+            for _ in range(8):
+                if frame is None:
+                    break
+                stack.append(Path(frame.f_code.co_filename).name + ":" +
+                             frame.f_code.co_name + ":" + str(frame.f_lineno))
+                frame = frame.f_back
+            locations[code] = " <- ".join(stack)
         raise PermissionError("DEPENDENCY_GUARD_" + code)
 
     def path_check(value, write=False):
@@ -162,9 +184,9 @@ def child(config_path):
                     raise AssertionError("GUARD_NOT_ENFORCED")
             target = run / "tmp/allowed.txt"
             target.write_text("synthetic", encoding="utf-8")
-            assert target.read_text(encoding="utf-8") == "synthetic"
+            assert target.read_text(encoding="utf-8") == "synthetic", "ALLOWED_TEMP_ROUNDTRIP_MISMATCH"
             assert blocked == Counter(READ_OUTSIDE_ALLOWLIST=1, WRITE_OUTSIDE_RUN=1,
-                                      PRIVATE_FILE=2, NETWORK=3, PROCESS=1, NATIVE_NETWORK=2)
+                                      PRIVATE_FILE=2, NETWORK=3, PROCESS=1, NATIVE_NETWORK=2), "GUARD_COUNT_MISMATCH"
             print("GUARD_SELF_CHECK=" + json.dumps({"passed": len(checks) + 1, "events": dict(blocked)}))
             blocked.clear()  # 위에서 정확히 기대한 거절만 성공으로 판정했다.
         elif config["mode"] == "contracts":
@@ -177,6 +199,7 @@ def child(config_path):
     except Exception as exc:
         # 경로나 공급자 예외 본문을 CI 공개 로그에 옮기지 않는다.
         print("DEPENDENCY_FAILURE=" + type(exc).__name__)
+        print("DEPENDENCY_CODE=" + failure_code(exc))
         code = 1
     print("GUARD_EVENTS=" + json.dumps(dict(blocked), sort_keys=True))
     print("GUARD_LOCATIONS=" + json.dumps(locations, sort_keys=True))

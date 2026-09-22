@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.metadata
+import json
 import re
 import ssl
 from datetime import datetime
@@ -11,6 +12,18 @@ import zoneinfo
 
 def normalize(name):
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def public_packages(packages):
+    """새 CI 환경의 배포 이름/버전만 기록하고 비정상 metadata 문자열은 가린다."""
+    result = {}
+    for name, version in sorted(packages.items())[:100]:
+        if (re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,99}", name) and
+                re.fullmatch(r"[A-Za-z0-9_.+!-]{1,80}", version)):
+            result[name] = version
+        else:
+            result["invalid_distribution_metadata"] = "redacted"
+    return result
 
 
 def guard_transports(reject):
@@ -29,6 +42,12 @@ def verify(source, site, reject):
     expected = {normalize(k): v for k, v in expected.items()}
     installed = {normalize(d.metadata["Name"]): d.version
                  for d in importlib.metadata.distributions(path=[str(site)])}
+    mismatches = {k: installed.get(k, "missing") for k, v in expected.items() if installed.get(k) != v}
+    extras = {k: v for k, v in installed.items() if k not in expected and k not in {"pip", "setuptools", "wheel"}}
+    if mismatches:
+        print("PACKAGE_MISMATCHES=" + json.dumps(public_packages(mismatches), sort_keys=True))
+    if extras:
+        print("UNLOCKED_PACKAGES=" + json.dumps(public_packages(extras), sort_keys=True))
     assert expected and all(installed.get(k) == v for k, v in expected.items()), "PACKAGE_MISMATCH"
     assert not set(installed) - set(expected) - {"pip", "setuptools", "wheel"}, "UNLOCKED_PACKAGE"
 
@@ -43,39 +62,39 @@ def verify(source, site, reject):
     yfinance.download = lambda *a, **k: reject("PROVIDER")
 
     prepared = requests.Request("GET", "https://example.invalid/synthetic", params={"n": "1"}).prepare()
-    assert prepared.url == "https://example.invalid/synthetic?n=1"
+    assert prepared.url == "https://example.invalid/synthetic?n=1", "REQUEST_PREPARATION_FAILED"
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     context.load_verify_locations(cafile=certifi.where())
-    assert context.cert_store_stats()["x509_ca"] > 0
+    assert context.cert_store_stats()["x509_ca"] > 0, "CERTIFI_TRUST_EMPTY"
     curl = curl_cffi.Curl()
     curl.close()
     ffi = cffi.FFI()
-    assert ffi.new("int *", 7)[0] == 7
+    assert ffi.new("int *", 7)[0] == 7, "CFFI_MEMORY_MISMATCH"
 
     values = np.array([100.0, 101.25, 102.5])
     frame = pd.DataFrame({"Close": values}, index=pd.date_range("2001-01-01", periods=3, tz="UTC"))
-    assert float(frame["Close"].iloc[-1]) == 102.5 and np.isfinite(values).all()
-    assert not np.isfinite(np.array([np.nan, np.inf])).any()
+    assert float(frame["Close"].iloc[-1]) == 102.5 and np.isfinite(values).all(), "DATAFRAME_RESULT_MISMATCH"
+    assert not np.isfinite(np.array([np.nan, np.inf])).any(), "NONFINITE_RESULT_MISMATCH"
     offsets = {"UTC": (0, 0), "Asia/Seoul": (32400, 32400), "America/New_York": (-18000, -14400)}
     assert zoneinfo.TZPATH == (), "SYSTEM_TZPATH_ACTIVE"
     for zone, expected_offsets in offsets.items():
         for month, seconds in zip((1, 7), expected_offsets):
             value = datetime(2001, month, 15, 12)
-            assert value.replace(tzinfo=ZoneInfo(zone)).utcoffset().total_seconds() == seconds
-            assert pd.Timestamp(value).tz_localize(zone).utcoffset().total_seconds() == seconds
+            assert value.replace(tzinfo=ZoneInfo(zone)).utcoffset().total_seconds() == seconds, "ZONEINFO_OFFSET_MISMATCH"
+            assert pd.Timestamp(value).tz_localize(zone).utcoffset().total_seconds() == seconds, "PANDAS_OFFSET_MISMATCH"
 
     from lxml import etree
     from bs4 import BeautifulSoup
-    assert etree.fromstring(b"<root><price>7</price></root>").findtext("price") == "7"
-    assert BeautifulSoup("<p>synthetic</p>", "lxml").p.text == "synthetic"
+    assert etree.fromstring(b"<root><price>7</price></root>").findtext("price") == "7", "LXML_PARSE_MISMATCH"
+    assert BeautifulSoup("<p>synthetic</p>", "lxml").p.text == "synthetic", "BS4_PARSE_MISMATCH"
     from google.protobuf.struct_pb2 import Struct
     message = Struct(); message.update({"price": 7.0})
     restored = Struct(); restored.ParseFromString(message.SerializeToString())
-    assert restored["price"] == 7.0
+    assert restored["price"] == 7.0, "PROTOBUF_ROUNDTRIP_MISMATCH"
     from peewee import SqliteDatabase
     db = SqliteDatabase(":memory:")
     try:
-        assert db.execute_sql("select 7").fetchone()[0] == 7
+        assert db.execute_sql("select 7").fetchone()[0] == 7, "SQLITE_ROUNDTRIP_MISMATCH"
     finally:
         db.close()
     # guard 자체의 차단 시험은 별도 프로세스에서 수행한다. 여기서는 0 이벤트가 필수다.

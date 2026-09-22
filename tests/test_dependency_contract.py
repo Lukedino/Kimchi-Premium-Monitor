@@ -147,6 +147,22 @@ class DependencyContractTests(unittest.TestCase):
         self.assertEqual(len(resets), 1)
         self.assertEqual(ast.literal_eval(resets[0].args[0]), ())
 
+    def test_failure_diagnostics_do_not_expose_arbitrary_exception_text(self):
+        scope = runpy.run_path(str(ROOT / "scripts/dependency_smoke.py"))
+        classify = scope["failure_code"]
+        self.assertEqual(classify(AssertionError("PACKAGE_MISMATCH")), "PACKAGE_MISMATCH")
+        self.assertEqual(classify(AssertionError("UNLOCKED_PACKAGE")), "UNLOCKED_PACKAGE")
+        for error in (AssertionError("SYNTHETIC_PRIVATE /private/path"),
+                      ValueError("PACKAGE_MISMATCH"), AssertionError()):
+            self.assertEqual(classify(error), "UNCLASSIFIED_FAILURE")
+
+    def test_public_package_diagnostics_allow_only_distribution_metadata(self):
+        scope = runpy.run_path(str(ROOT / "scripts/dependency_native.py"))
+        sanitize = scope["public_packages"]
+        self.assertEqual(sanitize({"packaging": "26.3"}), {"packaging": "26.3"})
+        value = sanitize({"/private/canary": "SYNTHETIC_PRIVATE", "package": "secret\nvalue"})
+        self.assertEqual(value, {"invalid_distribution_metadata": "redacted"})
+
 
 if __name__ == "__main__":
     unittest.main()
