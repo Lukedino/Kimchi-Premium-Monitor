@@ -1,4 +1,4 @@
-> 이 문서는 Codex 등 외부 에이전트용 안내문이다. 2026-09-18 작성.
+> **이 문서는 GPT(Codex) 크로스체크용 참고 자료다. 2026-09-18 작성.** 정본은 Claude 가 작성한 `README.md` 이다. 충돌하면 정본이 우선하고 이 문서를 고친다. 아래 "읽기 전용" 지시는 GPT 리뷰 세션에만 적용되며, 사용자가 승인한 Claude 작업을 제한하지 않는다. 운영 state·자격증명·금융 정책 경계는 어느 쪽이든 그대로다.
 
 > 2026-09-22 후속: 아래 읽기 전용 역할·파일 현황·무옵션 실행 설명은 초기 진단 당시 기록이다. 이후 사용자의 수정 및 검증 후 push 승인으로 개선을 반영했다. 현재 실행 모드, 상태 보존, 로컬 실행 잠금, 게시 재시도와 오프라인 검사는 README.md를 따른다. 실제 운영 상태·자격증명·금융 정책은 별도 승인 범위를 지킨다.
 
@@ -19,14 +19,14 @@
 ## 2. 파일 지도
 | 경로 | 역할 |
 |---|---|
-| `monitor.py` (830줄) | 전부. 상태 관리 → 데이터 수집 → 김프 계산 → 알림 판단 → 텔레그램 → 상태 커밋 |
-| `.github/workflows/kimp-monitor.yml` | 유일한 워크플로. cron `*/15 * * * *` + `workflow_dispatch` |
+| `monitor.py` | 진입점. 상태 관리 → 데이터 수집 → 김프 계산 → 알림 판단 → 텔레그램 → 상태 커밋 |
+| `.github/workflows/kimp-monitor.yml` | 주 워크플로. cron `*/15 * * * *` + `workflow_dispatch` |
 | `state.json` | 봇이 쓰는 상태 파일. 키: `history`(최대 10건), `last_alert`(`usdt_low`·`usdt_high`·`gold_low`·`gold_high`) |
 | `requirements.txt` | `requests`, `yfinance` 를 `==` 로 고정(해시 고정은 아님, 전이 의존성 미고정) |
-| `README.md` | 2줄짜리. 문서 역할 없음 |
+| `README.md` | 사용법 |
 | `.gitignore`, `LICENSE`(MIT) | — |
 
-테스트 코드·린트 설정·`.env.example` 은 **없다**.
+린트 설정·`.env.example` 은 없다. 테스트는 `tests/`.
 
 ## 3. 실행 구조
 - **진입점**: `python monitor.py` → `main()`. 순서: `load_state()` → `get_usd_krw_rate()` → 테더 블록 → 금 블록 → `add_history()` → (수동 실행이면 현황 리포트) → `send_telegram()` → `save_state()`.
@@ -42,8 +42,7 @@ pip install -r requirements.txt
 python monitor.py
 ```
 - 텔레그램 변수가 없으면 전송만 건너뛰고 나머지는 돈다.
-- ⚠️ **로컬 실행도 `save_state()` 에서 실제로 `git commit` + `git push` 를 시도한다**(드라이런 스위치 없음). 리뷰 중에는 실행하지 말고 코드만 읽을 것.
-- 자동 테스트는 없다. `pytest` 등 실행할 대상이 없다.
+- ⚠️ **`--live --publish-state` 와 `--publish-only` 는 실제로 `git commit` + `git push` 를 시도한다**(`--live` 만으로는 Git 작업 없음, `--dry-run` 은 발송·저장·Git 전부 없음). 리뷰 중에는 실행하지 말고 코드만 읽을 것.
 
 ## 5. 절대 규칙·함정
 - 공개 저장소다. 토큰·chat id·개인 정보를 코드·로그·이슈·리뷰 산출물 어디에도 적지 말 것.
@@ -62,7 +61,7 @@ python monitor.py
 - 환율 조회 실패는 치명(텔레그램 통지 후 `sys.exit(1)`), 테더·금 개별 실패는 비치명(로그만 남기고 계속)으로 나눠 둔 것은 의도다. 다만 그 결과는 7절에서 본다.
 
 ## 7. 리뷰 시 집중할 위험 지점
-1. **워크플로 권한·공급망** — `.github/workflows/kimp-monitor.yml`: 액션이 SHA 가 아니라 태그(`@v4`, `@v5`)로 고정, `contents: write` 토큰이 체크아웃 자격증명으로 남은 상태에서 서드파티 패키지가 실행된다. `concurrency` 그룹 없음.
+1. **워크플로 권한·공급망** — `.github/workflows/kimp-monitor.yml`: 액션이 SHA 가 아니라 태그(`@v4`, `@v5`)로 고정, `contents: write` 토큰이 체크아웃 자격증명으로 남은 상태에서 서드파티 패키지가 실행된다.
 2. **상태 커밋 경쟁·push 실패** — `monitor.py` `save_state()`: push 실패 시 재시도·rebase 없이 로그 한 줄로 끝나고 종료코드는 0. `add`·`commit` 반환코드는 확인하지 않는다. 실패하면 `last_alert` 가 유실돼 다음 실행에서 같은 알림이 중복될 수 있다. 예약 실행과 수동 실행이 겹치는 경우를 볼 것.
 3. **NaN·비정상값 전파** — `get_usd_krw_rate()` 의 Yahoo/er-api 폴백과 `get_upbit_usdt_price()` 에는 범위 검증이 없다(금은 `GOLD_PRICE_MIN_USD`~`MAX` 검증 있음). 환율이 NaN 이면 `main()` 테더 블록의 두 비교가 모두 False 가 되어 **else 분기가 `last_alert` 를 지우는지**, `add_history()` 가 NaN 을 JSON 에 쓰는지 확인. `import math` 는 미사용.
 4. **시점 불일치로 인한 오경보** — 24시간 도는 Upbit·국제 금 시세를, 장 마감 후 멈춘 네이버 환율·KRX 금 종가와 비교한다. `main()` 에 장 시간 게이트가 없고 `get_krx_gold_price_per_gram()` 은 거래일을 확인하지 않는다.
