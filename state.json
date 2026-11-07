@@ -1,14 +1,6 @@
 {
   "history": [
     {
-      "time": "2026-11-05T12:36:39.684065+09:00",
-      "usdt_kimp": 0.1935,
-      "gold_kimp": 0.0437,
-      "usd_krw": 1343.4,
-      "intl_gold_usd_oz": 4136.295,
-      "krx_gold_krw_g": 178730.0
-    },
-    {
       "time": "2026-11-05T20:31:02.009358+09:00",
       "usdt_kimp": 0.0149,
       "gold_kimp": -0.0879,
@@ -79,13 +71,17 @@
       "usd_krw": 1364.0,
       "intl_gold_usd_oz": 4070.9300000000003,
       "krx_gold_krw_g": 176690.0
+    },
+    {
+      "time": "2026-11-08T03:10:18.107854+09:00",
+      "usdt_kimp": 0.0733,
+      "gold_kimp": -1.0278,
+      "usd_krw": 1364.0,
+      "intl_gold_usd_oz": 4070.9300000000003,
+      "krx_gold_krw_g": 176690.0
     }
   ],
   "last_alert": {
-    "usdt_low": {
-      "value": -0.22742278629593643,
-      "time": "2026-11-07T05:42:10.101106+09:00"
-    },
     "gold_low": {
       "value": -1.0277992024029337,
       "time": "2026-11-07T09:22:55.013820+09:00",
@@ -98,39 +94,39 @@
   "health": {
     "fx": {
       "status": "ok",
-      "last_success": "2026-11-07T13:24:49.423699+00:00",
+      "last_success": "2026-11-07T18:10:19.233683+00:00",
       "consecutive_failures": 0
     },
     "usdt": {
       "status": "ok",
-      "last_success": "2026-11-07T13:24:50.270509+00:00",
+      "last_success": "2026-11-07T18:10:20.056353+00:00",
       "consecutive_failures": 0,
       "last_failure": "2026-10-18T21:23:58.923052+00:00"
     },
     "gold": {
       "status": "ok",
-      "last_success": "2026-11-07T13:24:51.734135+00:00",
+      "last_success": "2026-11-07T18:10:21.583989+00:00",
       "consecutive_failures": 0
     }
   },
   "run": {
-    "time": "2026-11-07T22:24:48.269997+09:00",
+    "time": "2026-11-08T03:10:18.107854+09:00",
     "status": "ok",
     "failed_sources": [],
     "failed_alerts": 0,
     "timing_version": 1,
-    "started_at": "2026-11-07T13:24:48.269997+00:00",
-    "finished_at": "2026-11-07T13:24:51.734186+00:00",
-    "duration_seconds": 3.464180314,
+    "started_at": "2026-11-07T18:10:18.107854+00:00",
+    "finished_at": "2026-11-07T18:10:21.584031+00:00",
+    "duration_seconds": 3.4761713390000004,
     "run_mode": "schedule",
-    "observed_interval_seconds": 25305.504965,
+    "observed_interval_seconds": 17129.837857,
     "schedule_delay_seconds": null,
     "issues": [],
     "price_evidence": {
       "fx": {
         "value": 1364.0,
         "source": "naver_fx",
-        "fetched_at": "2026-11-07T13:24:49.422765+00:00",
+        "fetched_at": "2026-11-07T18:10:19.232929+00:00",
         "source_time": null,
         "source_date": null,
         "time_precision": "unknown",
@@ -138,10 +134,10 @@
         "time_issue": "unverified_time_contract"
       },
       "usdt": {
-        "value": 1364.0,
+        "value": 1365.0,
         "source": "upbit",
-        "fetched_at": "2026-11-07T13:24:50.269507+00:00",
-        "source_time": "2026-11-07T13:24:48+00:00",
+        "fetched_at": "2026-11-07T18:10:20.055520+00:00",
+        "source_time": "2026-11-07T18:10:13+00:00",
         "source_date": null,
         "time_precision": "instant",
         "time_resolution": "second",
@@ -150,7 +146,7 @@
       "krx_gold": {
         "value": 176690.0,
         "source": "naver_krx_api",
-        "fetched_at": "2026-11-07T13:24:51.368974+00:00",
+        "fetched_at": "2026-11-07T18:10:21.156184+00:00",
         "source_time": null,
         "source_date": null,
         "time_precision": "unknown",
@@ -160,7 +156,7 @@
       "international_gold": {
         "value": 4070.9300000000003,
         "source": "swissquote",
-        "fetched_at": "2026-11-07T13:24:51.733193+00:00",
+        "fetched_at": "2026-11-07T18:10:21.583166+00:00",
         "source_time": null,
         "source_date": null,
         "time_precision": "unknown",
@@ -171,7 +167,7 @@
     "finished_scope": "collection_and_delivery"
   },
   "scheduled_start": {
-    "started_at": "2026-11-07T13:24:48.269997+00:00",
-    "run_id": "42376825193"
+    "started_at": "2026-11-07T18:10:18.107854+00:00",
+    "run_id": "42399899126"
   }
 }
