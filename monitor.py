@@ -13,6 +13,7 @@ import json
 import re
 import math
 import argparse
+import html
 import base64
 import subprocess
 import tempfile
@@ -367,21 +368,21 @@ def should_alert(state: dict, key: str, current_value: float, now: datetime) -> 
     prev = last_alert.get(key)
 
     if prev is None:
-        return True, "첫 알림"
+        return True, "판정: 첫 알림"
 
     prev_value = prev["value"]
     diff       = current_value - prev_value
 
     if key.endswith("_low"):
         if current_value < prev_value:
-            return True, f"악화 ({prev_value:+.2f}% → {current_value:+.2f}%, {diff:+.2f}%p)"
+            return True, f"변화: {prev_value:+.2f}% → {current_value:+.2f}% ({diff:+.2f}%p)"
         else:
             print(f"  [Filter] {key}: 이전 {prev_value:+.2f}% → 현재 {current_value:+.2f}% (개선 방향) — 알림 생략")
             return False, ""
 
     if key.endswith("_high"):
         if current_value > prev_value:
-            return True, f"악화 ({prev_value:+.2f}% → {current_value:+.2f}%, {diff:+.2f}%p)"
+            return True, f"변화: {prev_value:+.2f}% → {current_value:+.2f}% ({diff:+.2f}%p)"
         else:
             print(f"  [Filter] {key}: 이전 {prev_value:+.2f}% → 현재 {current_value:+.2f}% (개선 방향) — 알림 생략")
             return False, ""
@@ -444,7 +445,9 @@ def should_alert_gold_step(state: dict, key: str, current_value: float,
     if prev is None:
         # 첫 진입
         threshold = GOLD_KIMP_LOW if direction == "low" else GOLD_KIMP_HIGH
-        reason = f"첫 알림 (기준 {threshold}% 돌파, Level {current_level})"
+        step_threshold = (threshold - current_level * GOLD_KIMP_STEP if direction == "low"
+                          else threshold + current_level * GOLD_KIMP_STEP)
+        reason = f"단계: {current_level} ({fmt_pct_line(step_threshold)} 선 돌파) · 첫 알림"
         return True, reason, current_level
     
     prev_level = prev.get("step_level", 0)
@@ -454,16 +457,14 @@ def should_alert_gold_step(state: dict, key: str, current_value: float,
         if direction == "low":
             step_threshold = GOLD_KIMP_LOW - (current_level * GOLD_KIMP_STEP)
             reason = (
-                f"Level {prev_level}→{current_level} "
-                f"({step_threshold:+.0f}% 선 돌파, "
-                f"이전 {prev['value']:+.2f}% → 현재 {current_value:+.2f}%)"
+                f"단계: {prev_level}→{current_level} ({fmt_pct_line(step_threshold)} 선 돌파)\n"
+                f"변화: {prev['value']:+.2f}% → {current_value:+.2f}%"
             )
         else:
             step_threshold = GOLD_KIMP_HIGH + (current_level * GOLD_KIMP_STEP)
             reason = (
-                f"Level {prev_level}→{current_level} "
-                f"({step_threshold:+.0f}% 선 돌파, "
-                f"이전 {prev['value']:+.2f}% → 현재 {current_value:+.2f}%)"
+                f"단계: {prev_level}→{current_level} ({fmt_pct_line(step_threshold)} 선 돌파)\n"
+                f"변화: {prev['value']:+.2f}% → {current_value:+.2f}%"
             )
         return True, reason, current_level
     
@@ -509,11 +510,11 @@ def analyze_gold_kimp_driver(
     금 김프 변동의 주요 원인을 분석합니다.
     
     이전 상태(state.history 또는 last_alert)와 비교하여
-    환율 / 국제금값 / 국내금값 각각의 변동률을 계산하고
+    환율 / 국제 금값 / 국내 금값 각각의 변동률을 계산하고
     어느 요인이 김프 변동을 주도했는지 판별합니다.
     
     Returns:
-        원인 분석 문자열 (예: "📌 주요인: 환율 상승 (+0.8%)")
+        원인 분석 평문 (첫 줄 "변동 원인 · …", 마지막 줄 "주요인: …")
     """
     # 이전 데이터 찾기: last_alert → history 순으로 탐색
     prev_fx = None
@@ -542,7 +543,7 @@ def analyze_gold_kimp_driver(
                 break
     
     if prev_fx is None or prev_intl_gold is None:
-        return "📌 원인 분석: 이전 데이터 없음 (첫 실행)"
+        return "변동 원인\n비교할 이전 시세 없음"
     
     # 변동률 계산
     fx_change_pct = ((current_usd_krw - prev_fx) / prev_fx) * 100
@@ -573,8 +574,8 @@ def analyze_gold_kimp_driver(
     # 금 김프 = (국내금 - 국제금×환율) / (국제금×환율)
     # 김프 하락 요인:
     #   - 환율 상승 → 국제금(원화 환산) 상승 → 김프 하락
-    #   - 국제금값 상승 → 국제금(원화 환산) 상승 → 김프 하락
-    #   - 국내금값 하락 → 김프 하락
+    #   - 국제 금값 상승 → 국제금(원화 환산) 상승 → 김프 하락
+    #   - 국내 금값 하락 → 김프 하락
     
     # 국제금(원화환산) 변동 = 환율변동 + 금값변동 (근사)
     intl_krw_change_approx = fx_change_pct + intl_gold_change_pct
@@ -595,52 +596,48 @@ def analyze_gold_kimp_driver(
     factor_list.sort(key=lambda x: abs(x[1]), reverse=True)
     
     lines = []
-    if period_str:
-        lines.append(f"📌 변동 원인 ({period_str})")
-    else:
-        lines.append("📌 변동 원인 분석")
-    
+    # 첫 줄은 섹션 제목(메시지에서 굵게), 나머지는 평문 — 로그에도 그대로 찍힌다.
+    lines = [f"변동 원인 · {period_str}" if period_str else "변동 원인"]
+    labels = {"환율": "원/달러", "국제금": "국제 금", "국내금": "국내 금"}
+
     for name, change_pct, current, prev, unit in factor_list:
         if abs(change_pct) < 0.01:
-            arrow = "→"
-            tag = "변동없음"
+            move = "보합"
         elif change_pct > 0:
-            arrow = "↑"
-            tag = "상승"
+            move = f"↑ {change_pct:+.2f}%"
         else:
-            arrow = "↓"
-            tag = "하락"
-        
-        if unit == "원":
-            lines.append(f"  {arrow} {name}: {prev:,.0f}→{current:,.0f}{unit} ({change_pct:+.2f}%, {tag})")
-        elif unit == "$/oz":
-            lines.append(f"  {arrow} {name}: ${prev:,.0f}→${current:,.0f} ({change_pct:+.2f}%, {tag})")
+            move = f"↓ {change_pct:+.2f}%"
+
+        if unit == "$/oz":
+            span = f"${prev:,.0f} → ${current:,.0f}/oz"
         else:
-            lines.append(f"  {arrow} {name}: {prev:,.0f}→{current:,.0f}{unit} ({change_pct:+.2f}%, {tag})")
+            span = f"{prev:,.0f}{unit} → {current:,.0f}{unit}"
+        lines.append(f"• {labels.get(name, name)} {move}")
+        lines.append(f"  {span}")
     
     # 주요인 한 줄 요약
     top_name, top_change, _, _, _ = factor_list[0]
     if abs(top_change) >= 0.05:
         if top_name == "환율":
             if top_change > 0:
-                summary = f"💡 주요인: 환율 상승 → 국제금(원화) 비싸짐 → 김프 하락"
+                summary = f"주요인: 환율 상승 → 국제 금(원화) 비싸짐 → 김프 하락"
             else:
-                summary = f"💡 주요인: 환율 하락 → 국제금(원화) 싸짐 → 김프 상승"
+                summary = f"주요인: 환율 하락 → 국제 금(원화) 싸짐 → 김프 상승"
         elif top_name == "국제금":
             if top_change > 0:
-                summary = f"💡 주요인: 국제금값 상승 → 국제금(원화) 비싸짐 → 김프 하락"
+                summary = f"주요인: 국제 금값 상승 → 국제 금(원화) 비싸짐 → 김프 하락"
             else:
-                summary = f"💡 주요인: 국제금값 하락 → 국제금(원화) 싸짐 → 김프 상승"
+                summary = f"주요인: 국제 금값 하락 → 국제 금(원화) 싸짐 → 김프 상승"
         elif top_name == "국내금":
             if top_change > 0:
-                summary = f"💡 주요인: 국내금값 상승 → 김프 상승"
+                summary = f"주요인: 국내 금값 상승 → 김프 상승"
             else:
-                summary = f"💡 주요인: 국내금값 하락 → 김프 하락"
+                summary = f"주요인: 국내 금값 하락 → 김프 하락"
         else:
-            summary = f"💡 주요인: {top_name} ({top_change:+.2f}%)"
+            summary = f"주요인: {top_name} ({top_change:+.2f}%)"
         lines.append(summary)
     else:
-        lines.append("💡 모든 요인 소폭 변동 — 복합적 원인")
+        lines.append("주요인: 모든 요인 소폭 변동 — 복합적 원인")
     
     return "\n".join(lines)
 
@@ -868,27 +865,247 @@ def calc_gold_kimp(
 #  알림
 # ═══════════════════════════════════════════════════════
 
+TELEGRAM_MAX_LEN = 4096
+_WEEKDAYS = "월화수목금토일"
+_SOURCE_NAMES = {"fx": "환율", "usdt": "테더", "gold": "금"}
+_ERROR_NAMES = {
+    "ConnectionError": "연결 실패",
+    "ConnectTimeout": "응답 시간 초과",
+    "ReadTimeout": "응답 시간 초과",
+    "Timeout": "응답 시간 초과",
+    "TimeoutError": "응답 시간 초과",
+    "SSLError": "보안 연결 실패",
+    "HTTPError": "서버 오류 응답",
+    "JSONDecodeError": "응답 형식 오류",
+    "KeyError": "응답 형식 오류",
+    "IndexError": "응답 형식 오류",
+    "TypeError": "응답 형식 오류",
+    "ValueError": "비정상 값",
+}
+
+
+def esc(value) -> str:
+    """텔레그램 HTML 본문에 넣는 가변 문자열 이스케이프."""
+    return html.escape(str(value), quote=False)
+
+
+def fmt_kst(dt: datetime, *, ref: datetime = None) -> str:
+    """한국 시각 'MM/DD(요일) HH:MM'. ref 와 연도가 다르면 연도를 붙인다."""
+    local = dt.astimezone(KST)
+    ref_year = ref.astimezone(KST).year if ref is not None else local.year
+    date = local.strftime("%m/%d") if local.year == ref_year else local.strftime("%Y/%m/%d")
+    return f"{date}({_WEEKDAYS[local.weekday()]}) {local.strftime('%H:%M')}"
+
+
+def fmt_pct_line(value: float) -> str:
+    """임계값 표기: 0 → '0%', -2.0 → '-2%', 0.5 → '+0.5%'."""
+    if value == 0:
+        return "0%"
+    return f"{value:+g}%"
+
+
+def error_label(error_type: str) -> str:
+    known = _ERROR_NAMES.get(error_type)
+    if known:
+        return known
+    return f"기타 오류 <code>{esc(error_type)}</code>"
+
+
+_TAG_RE = re.compile(r"</?(?:b|i|u|s|code|pre|blockquote|a)(?:\s[^>]*)?>")
+
+
+def _html_to_plain(text: str) -> str:
+    return html.unescape(_TAG_RE.sub("", text))
+
+
+def _hard_cut(line: str, limit: int) -> list:
+    pieces = []
+    while len(line) > limit:
+        cut = limit
+        # 태그·엔티티 중간에서 자르지 않는다.
+        lt = line.rfind("<", 0, cut)
+        if lt > line.rfind(">", 0, cut):
+            cut = lt
+        amp = line.rfind("&", 0, cut)
+        if amp > line.rfind(";", 0, cut):
+            cut = amp
+        if cut <= 0:
+            cut = limit
+        pieces.append(line[:cut])
+        line = line[cut:]
+    pieces.append(line)
+    return pieces
+
+
+def split_message(text: str, limit: int = TELEGRAM_MAX_LEN) -> list:
+    """이스케이프된 본문을 빈 줄(섹션) → 줄 경계로 나눈다."""
+    if len(text) <= limit:
+        return [text]
+    chunks, current = [], ""
+    for section in text.split("\n\n"):
+        candidate = f"{current}\n\n{section}" if current else section
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(section) <= limit:
+            current = section
+            continue
+        for line in section.split("\n"):
+            for piece in _hard_cut(line, limit):
+                candidate = f"{current}\n{piece}" if current else piece
+                if len(candidate) <= limit:
+                    current = candidate
+                else:
+                    chunks.append(current)
+                    current = piece
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _is_parse_error(resp) -> bool:
+    if resp.status_code != 400:
+        return False
+    try:
+        description = str(resp.json().get("description", ""))
+    except Exception:
+        return False
+    return "parse entities" in description.lower()
+
+
+def _api_ok(resp) -> bool:
+    try:
+        return bool(resp.ok) and resp.json().get("ok") is True
+    except Exception:
+        return False
+
+
+def _post_telegram(url: str, text: str, *, as_html: bool):
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "link_preview_options": {"is_disabled": True},
+    }
+    if as_html:
+        payload["parse_mode"] = "HTML"
+    return _requests().post(url, json=payload, timeout=10)
+
+
 def send_telegram(message: str) -> bool:
+    """HTML 로 발송. 400 해석 실패면 평문 재전송, 4,096자 초과는 나눠 보낸다.
+    로그에는 본문·응답 설명을 남기지 않는다(공개 저장소)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("  [Telegram] 토큰/채팅ID 미설정 — 알림 건너뜀")
         return False
-    url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id":    TELEGRAM_CHAT_ID,
-        "text":       message,
-        "parse_mode": "HTML",
-    }
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        resp = _requests().post(url, json=payload, timeout=10)
-        if resp.ok and resp.json().get("ok") is True:
-            print("  [Telegram] 알림 전송 성공")
-            return True
-        else:
-            print(f"  [Telegram] 전송 실패: HTTP {resp.status_code}")
+        for chunk in split_message(message):
+            resp = _post_telegram(url, chunk, as_html=True)
+            if not _api_ok(resp) and _is_parse_error(resp):
+                print("  [Telegram] HTML 해석 실패 — 평문으로 재전송")
+                resp = _post_telegram(url, _html_to_plain(chunk), as_html=False)
+            if not _api_ok(resp):
+                print(f"  [Telegram] 전송 실패: HTTP {resp.status_code}")
+                return False
+        print("  [Telegram] 알림 전송 성공")
+        return True
     except Exception as e:
         # 예외 문자열에 요청 URL(봇 토큰 포함)이 실릴 수 있어 타입만 남긴다 (2026-08-27 보안점검)
         print(f"  [Telegram] 전송 오류: {type(e).__name__}")
     return False
+
+
+# ── 메시지 양식 (작업공간 텔레그램 공통 양식, 출처 [김프]) ─────
+
+def format_source_failure(source: str, failures: int, error_type: str, now: datetime) -> str:
+    lines = [
+        "🟡 <b>[김프] 시세 수집 실패</b>",
+        f"{fmt_kst(now)} · {esc(_SOURCE_NAMES.get(source, source))}",
+        "",
+        f"연속 실패: {failures}회",
+        f"원인: {error_label(error_type)}",
+    ]
+    if source == "fx":
+        lines += ["", "ℹ️ 환율이 없어 이번 회차는 테더·금 김프를 계산하지 못했습니다."]
+    return "\n".join(lines)
+
+
+def _driver_block(driver_analysis: str) -> str:
+    head, _, rest = driver_analysis.partition("\n")
+    block = f"<b>{esc(head)}</b>"
+    return f"{block}\n{esc(rest)}" if rest else block
+
+
+def format_usdt_alert(direction: str, kimp: float, reason: str, upbit_usdt: float,
+                      usd_krw: float, now: datetime) -> str:
+    if direction == "low":
+        head, basis = "🟢 <b>[김프] 테더 김프 낮음</b>", f"기준 {fmt_pct_line(USDT_KIMP_LOW)} 이하"
+    else:
+        head, basis = "🟡 <b>[김프] 테더 김프 높음</b>", f"기준 {fmt_pct_line(USDT_KIMP_HIGH)} 이상"
+    return "\n".join([
+        head,
+        f"{fmt_kst(now)} · {basis}",
+        "",
+        f"김프: <b>{kimp:+.2f}%</b>",
+        esc(reason),
+        f"업비트 USDT: {upbit_usdt:,.0f}원",
+        f"원/달러: {usd_krw:,.2f}원",
+    ])
+
+
+def format_gold_alert(direction: str, kimp: float, reason: str, krx_gold: float,
+                      intl_gold_krw_g: float, intl_gold_oz: float, usd_krw: float,
+                      driver_analysis: str, now: datetime) -> str:
+    if direction == "low":
+        head, basis = "🟢 <b>[김프] 금 김프 낮음</b>", f"기준 {fmt_pct_line(GOLD_KIMP_LOW)} 이하"
+    else:
+        head, basis = "🟡 <b>[김프] 금 김프 높음</b>", f"기준 {fmt_pct_line(GOLD_KIMP_HIGH)} 이상"
+    return "\n".join([
+        head,
+        f"{fmt_kst(now)} · {basis}",
+        "",
+        f"김프: <b>{kimp:+.2f}%</b>",
+        esc(reason),
+        "",
+        f"국내 금: {krx_gold:,.0f}원/g",
+        f"국제 금: {intl_gold_krw_g:,.0f}원/g · ${intl_gold_oz:,.2f}/oz",
+        f"원/달러: {usd_krw:,.2f}원",
+        "",
+        _driver_block(driver_analysis),
+    ])
+
+
+def format_manual_report(*, usdt_kimp, upbit_usdt, gold_kimp, krx_gold, intl_gold_krw_g,
+                         intl_gold_oz, usd_krw, driver_analysis, now) -> str:
+    def pct(value):
+        return f"<b>{value:+.2f}%</b>" if value is not None else "조회 실패"
+
+    parts = [
+        f"📊 <b>[김프] 현황 리포트</b>\n{fmt_kst(now)} · 수동 조회",
+        f"테더 김프: {pct(usdt_kimp)}\n금 김프: {pct(gold_kimp)}",
+    ]
+    if usdt_kimp is not None and upbit_usdt is not None:
+        parts.append("\n".join([
+            "<b>테더</b>",
+            f"업비트 USDT: {upbit_usdt:,.0f}원",
+            f"원/달러: {usd_krw:,.2f}원",
+            f"알림 기준: {fmt_pct_line(USDT_KIMP_LOW)} 이하 · {fmt_pct_line(USDT_KIMP_HIGH)} 이상",
+        ]))
+    if gold_kimp is not None and krx_gold is not None:
+        parts.append("\n".join([
+            "<b>금</b>",
+            f"국내 금: {krx_gold:,.0f}원/g",
+            f"국제 금: {intl_gold_krw_g:,.0f}원/g · ${intl_gold_oz:,.2f}/oz",
+            f"원/달러: {usd_krw:,.2f}원",
+            f"알림 기준: {fmt_pct_line(GOLD_KIMP_LOW)} 이하 · {fmt_pct_line(GOLD_KIMP_HIGH)} 이상",
+            f"단계 간격: {GOLD_KIMP_STEP:g}%p",
+        ]))
+        if driver_analysis:
+            parts.append(_driver_block(driver_analysis))
+    return "\n\n".join(parts)
 
 
 # ═══════════════════════════════════════════════════════
@@ -915,15 +1132,15 @@ def finish_run(state, now, failed_sources, failed_alerts, *, send_alerts,
         health = state["health"][source]
         threshold = 1 if source == "fx" else SOURCE_FAILURE_ALERT_AFTER
         if health["consecutive_failures"] >= threshold and "last_warning" not in health:
-            warning = (f"⚠ 시세 수집 실패: {source} "
-                       f"({health['consecutive_failures']}회 연속, {health['error_type']})")
+            warning = format_source_failure(source, health["consecutive_failures"],
+                                            health["error_type"], now)
             if send_alerts:
                 if send_telegram(warning):
                     health["last_warning"] = clock().isoformat()
                 else:
                     failed_alerts += 1
             else:
-                print(f"  [Dry run] {warning}")
+                print(f"  [Dry run] 수집 실패 알림 후보: {source}")
     status = "ok"
     if failed_sources or failed_alerts:
         status = "failed" if "fx" in failed_sources or len(failed_sources) == 2 else "partial_failure"
@@ -1033,27 +1250,14 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
         if usdt_kimp <= USDT_KIMP_LOW:
             send_it, reason = should_alert(state, "usdt_low", usdt_kimp, now)
             if send_it:
-                emoji     = "🔵" if usdt_kimp < 0 else "🟡"
-                alert_msg = (
-                    f"{emoji} <b>테더 김프 알림</b> (≤{USDT_KIMP_LOW}%, {reason})\n"
-                    f"김프: <b>{usdt_kimp:+.2f}%</b>\n"
-                    f"Upbit USDT: {upbit_usdt:,.0f}원\n"
-                    f"환율: {usd_krw:,.2f}원\n"
-                    f"⏰ {now.strftime('%H:%M KST')}"
-                )
+                alert_msg = format_usdt_alert("low", usdt_kimp, reason, upbit_usdt, usd_krw, now)
                 alerts.append((alert_msg, "usdt_low", usdt_kimp, None, None))
             state.get("last_alert", {}).pop("usdt_high", None)
 
         elif usdt_kimp >= USDT_KIMP_HIGH:
             send_it, reason = should_alert(state, "usdt_high", usdt_kimp, now)
             if send_it:
-                alert_msg = (
-                    f"🔴 <b>테더 김프 알림</b> (≥{USDT_KIMP_HIGH}%, {reason})\n"
-                    f"김프: <b>{usdt_kimp:+.2f}%</b>\n"
-                    f"Upbit USDT: {upbit_usdt:,.0f}원\n"
-                    f"환율: {usd_krw:,.2f}원\n"
-                    f"⏰ {now.strftime('%H:%M KST')}"
-                )
+                alert_msg = format_usdt_alert("high", usdt_kimp, reason, upbit_usdt, usd_krw, now)
                 alerts.append((alert_msg, "usdt_high", usdt_kimp, None, None))
             state.get("last_alert", {}).pop("usdt_low", None)
 
@@ -1078,6 +1282,7 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
     krx_gold        = None
     intl_gold_oz    = None
     intl_gold_krw_g = None
+    driver_analysis = None
     try:
         krx_gold = observed_price(get_krx_gold_price_per_gram, "KRX KRW/g", "krx_gold")
         intl_gold_oz = valid_gold_price(observed_price(get_international_gold_usd_per_oz,
@@ -1100,14 +1305,9 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
                 state, "gold_low", gold_kimp, "low", now
             )
             if send_it:
-                alert_msg = (
-                    f"🔵 <b>금 김프 알림</b> (≤{GOLD_KIMP_LOW}%, {reason})\n"
-                    f"김프: <b>{gold_kimp:+.2f}%</b>\n"
-                    f"국내: {krx_gold:,.0f}원/g\n"
-                    f"국제: {intl_gold_krw_g:,.0f}원/g  (${intl_gold_oz:,.2f}/oz)\n"
-                    f"환율: {usd_krw:,.2f}원\n"
-                    f"\n{driver_analysis}\n"
-                    f"\n⏰ {now.strftime('%H:%M KST')}"
+                alert_msg = format_gold_alert(
+                    "low", gold_kimp, reason, krx_gold, intl_gold_krw_g,
+                    intl_gold_oz, usd_krw, driver_analysis, now,
                 )
                 alerts.append((
                     alert_msg, "gold_low", gold_kimp, step_level,
@@ -1125,14 +1325,9 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
                 state, "gold_high", gold_kimp, "high", now
             )
             if send_it:
-                alert_msg = (
-                    f"🔴 <b>금 김프 알림</b> (≥{GOLD_KIMP_HIGH}%, {reason})\n"
-                    f"김프: <b>{gold_kimp:+.2f}%</b>\n"
-                    f"국내: {krx_gold:,.0f}원/g\n"
-                    f"국제: {intl_gold_krw_g:,.0f}원/g  (${intl_gold_oz:,.2f}/oz)\n"
-                    f"환율: {usd_krw:,.2f}원\n"
-                    f"\n{driver_analysis}\n"
-                    f"\n⏰ {now.strftime('%H:%M KST')}"
+                alert_msg = format_gold_alert(
+                    "high", gold_kimp, reason, krx_gold, intl_gold_krw_g,
+                    intl_gold_oz, usd_krw, driver_analysis, now,
                 )
                 alerts.append((
                     alert_msg, "gold_high", gold_kimp, step_level,
@@ -1156,6 +1351,7 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
 
     except Exception as e:
         gold_kimp = krx_gold = intl_gold_oz = intl_gold_krw_g = None
+        driver_analysis = None
         failed_sources.append("gold")
         record_source_result(state, "gold", clock(), e)
         print(f"  ⚠ 금 김프 계산 실패: {type(e).__name__}")
@@ -1190,30 +1386,11 @@ def _run_monitor(*, send_alerts=False, persist_state=False, publish=False,
 
     # ── 5. 수동 실행 시 현황 리포트 ────────────────────
     if is_manual and not alerts:
-        report = (
-            f"📊 <b>김프 현황 리포트</b> (수동 조회)\n\n"
-            f"테더 김프: <b>{usdt_str}</b>\n"
-            f"금 김프: <b>{gold_str}</b>\n"
+        report = format_manual_report(
+            usdt_kimp=usdt_kimp, upbit_usdt=upbit_usdt, gold_kimp=gold_kimp,
+            krx_gold=krx_gold, intl_gold_krw_g=intl_gold_krw_g, intl_gold_oz=intl_gold_oz,
+            usd_krw=usd_krw, driver_analysis=driver_analysis, now=now,
         )
-        if usdt_kimp is not None and upbit_usdt is not None:
-            report += (
-                f"\n[테더 상세]\n"
-                f"  Upbit USDT: {upbit_usdt:,.0f}원\n"
-                f"  환율: {usd_krw:,.2f}원\n"
-                f"  기준: ≤{USDT_KIMP_LOW}% 또는 ≥{USDT_KIMP_HIGH}%\n"
-            )
-        if gold_kimp is not None and krx_gold is not None:
-            report += (
-                f"\n[금 상세]\n"
-                f"  국내: {krx_gold:,.0f}원/g\n"
-                f"  국제: {intl_gold_krw_g:,.0f}원/g  (${intl_gold_oz:,.2f}/oz)\n"
-                f"  환율: {usd_krw:,.2f}원\n"
-                f"  기준: ≤{GOLD_KIMP_LOW}% 또는 ≥{GOLD_KIMP_HIGH}% (단계: {GOLD_KIMP_STEP}%p)\n"
-            )
-            # 수동 조회에도 원인 분석 포함
-            if 'driver_analysis' in dir():
-                report += f"\n{driver_analysis}\n"
-        report += f"\n⏰ {now.strftime('%Y-%m-%d %H:%M KST')}"
         alerts.append((report, None, None, None, None))
 
     # ── 6. 알림 전송 ────────────────────────────────────
