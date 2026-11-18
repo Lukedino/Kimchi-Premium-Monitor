@@ -1,14 +1,6 @@
 {
   "history": [
     {
-      "time": "2026-11-15T10:02:52.714071+09:00",
-      "usdt_kimp": 3.5075,
-      "gold_kimp": 0.6128,
-      "usd_krw": 1340.0,
-      "intl_gold_usd_oz": 3880.4049999999997,
-      "krx_gold_krw_g": 168200.0
-    },
-    {
       "time": "2026-11-15T16:51:58.251641+09:00",
       "usdt_kimp": 2.9104,
       "gold_kimp": 0.6128,
@@ -79,45 +71,53 @@
       "usd_krw": 1334.9,
       "intl_gold_usd_oz": 3860.815,
       "krx_gold_krw_g": 166860.0
+    },
+    {
+      "time": "2026-11-18T09:58:18.817987+09:00",
+      "usdt_kimp": 2.0132,
+      "gold_kimp": 0.1972,
+      "usd_krw": 1331.2,
+      "intl_gold_usd_oz": 3815.46,
+      "krx_gold_krw_g": 163620.0
     }
   ],
   "last_alert": {},
   "health": {
     "fx": {
       "status": "ok",
-      "last_success": "2026-11-17T18:11:43.468979+00:00",
+      "last_success": "2026-11-18T00:58:19.929002+00:00",
       "consecutive_failures": 0
     },
     "usdt": {
       "status": "ok",
-      "last_success": "2026-11-17T18:11:44.371468+00:00",
+      "last_success": "2026-11-18T00:58:20.753575+00:00",
       "consecutive_failures": 0,
       "last_failure": "2026-11-08T18:59:13.274254+00:00"
     },
     "gold": {
       "status": "ok",
-      "last_success": "2026-11-17T18:11:45.787366+00:00",
+      "last_success": "2026-11-18T00:58:22.191026+00:00",
       "consecutive_failures": 0
     }
   },
   "run": {
-    "time": "2026-11-18T03:11:42.373651+09:00",
+    "time": "2026-11-18T09:58:18.817987+09:00",
     "status": "ok",
     "failed_sources": [],
     "failed_alerts": 0,
     "timing_version": 1,
-    "started_at": "2026-11-17T18:11:42.373651+00:00",
-    "finished_at": "2026-11-17T18:11:45.787400+00:00",
-    "duration_seconds": 3.4137419459999983,
+    "started_at": "2026-11-18T00:58:18.817987+00:00",
+    "finished_at": "2026-11-18T00:58:22.191059+00:00",
+    "duration_seconds": 3.3730658779999985,
     "run_mode": "schedule",
-    "observed_interval_seconds": 33669.835281,
+    "observed_interval_seconds": 24396.444336,
     "schedule_delay_seconds": null,
     "issues": [],
     "price_evidence": {
       "fx": {
-        "value": 1334.9,
+        "value": 1331.2,
         "source": "naver_fx",
-        "fetched_at": "2026-11-17T18:11:43.468195+00:00",
+        "fetched_at": "2026-11-18T00:58:19.928155+00:00",
         "source_time": null,
         "source_date": null,
         "time_precision": "unknown",
@@ -125,19 +125,19 @@
         "time_issue": "unverified_time_contract"
       },
       "usdt": {
-        "value": 1362.0,
+        "value": 1358.0,
         "source": "upbit",
-        "fetched_at": "2026-11-17T18:11:44.370588+00:00",
-        "source_time": "2026-11-17T18:11:42+00:00",
+        "fetched_at": "2026-11-18T00:58:20.752636+00:00",
+        "source_time": "2026-11-18T00:58:19+00:00",
         "source_date": null,
         "time_precision": "instant",
         "time_resolution": "second",
         "time_issue": null
       },
       "krx_gold": {
-        "value": 166860.0,
+        "value": 163620.0,
         "source": "naver_krx_api",
-        "fetched_at": "2026-11-17T18:11:45.342711+00:00",
+        "fetched_at": "2026-11-18T00:58:21.699099+00:00",
         "source_time": null,
         "source_date": null,
         "time_precision": "unknown",
@@ -145,9 +145,9 @@
         "time_issue": "unverified_time_contract"
       },
       "international_gold": {
-        "value": 3860.815,
+        "value": 3815.46,
         "source": "swissquote",
-        "fetched_at": "2026-11-17T18:11:45.786499+00:00",
+        "fetched_at": "2026-11-18T00:58:22.190116+00:00",
         "source_time": null,
         "source_date": null,
         "time_precision": "unknown",
@@ -158,7 +158,7 @@
     "finished_scope": "collection_and_delivery"
   },
   "scheduled_start": {
-    "started_at": "2026-11-17T18:11:42.373651+00:00",
-    "run_id": "44145137465"
+    "started_at": "2026-11-18T00:58:18.817987+00:00",
+    "run_id": "44212106261"
   }
 }
