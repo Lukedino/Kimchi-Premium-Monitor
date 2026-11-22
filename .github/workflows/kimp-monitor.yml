@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 5
     permissions:
      contents: write
+     actions: read
     
     steps:
       - name: Checkout
@@ -59,4 +60,5 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MONITOR_OUTCOME: ${{ steps.monitor.outcome }}
           JOB_STATUS: ${{ job.status }}
+          GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python -B -S monitor.py --notify-transition

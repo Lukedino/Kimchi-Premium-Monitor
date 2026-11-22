@@ -9,6 +9,9 @@
   `skipped (unknown outcome)` 로 따로 남긴다.
 - 직전 결과: 익명 GitHub REST 로 같은 브랜치(GITHUB_REF_NAME, 없으면 main)의 완료 run 을 받아 자기 run 을 뺀 뒤
   success/failure 로 판정되는 첫 건. 조회 실패면 보내지 않는다(PA GHA 감시가 백업).
+- GH_API_TOKEN(잡의 GITHUB_TOKEN, actions: read)이 있으면 api.github.com 조회에만 Bearer 로
+  붙인다(익명 한도 60회/시 회피). 리다이렉트를 따르지 않는 opener 를 쓰고 헤더는 unredirected 로
+  넣어 다른 호스트로 넘어가지 않게 한다. Telegram 요청·로그에는 싣지 않는다. 없으면 익명.
 - 공개 저장소다. 로그는 `notify: <sent|skipped|failed> (<고정 사유>)` 한 줄뿐이고
   시세·임계값·URL·토큰·예외 문구를 싣지 않는다. 예외는 클래스 이름만 남긴다.
 - state.json 을 읽거나 쓰지 않는다. 종료 코드는 항상 0.
@@ -41,6 +44,20 @@ class HistoryUnavailable(Exception):
         self.reason = reason
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """3xx 를 따르지 않는다(HTTPError 로 끝나 조회 실패로 처리된다)."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
+def _default_urlopen(request, timeout):
+    return _OPENER.open(request, timeout=timeout)
+
+
 def runs_url(branch):
     return f"{RUNS_URL}&branch={urllib.parse.quote(branch or 'main', safe='')}"
 
@@ -68,12 +85,14 @@ def current_result(monitor_outcome, job_status):
     return "unknown", None  # 빈 값·알 수 없는 값은 판단하지 않는다
 
 
-def previous_conclusion(run_id, branch, *, urlopen):
+def previous_conclusion(run_id, branch, *, urlopen, api_token=""):
     request = urllib.request.Request(runs_url(branch), headers={
         "Accept": "application/vnd.github+json",
         "User-Agent": "kimp-monitor-notify",
         "X-GitHub-Api-Version": "2022-11-28",
     })
+    if api_token:
+        request.add_unredirected_header("Authorization", f"Bearer {api_token}")
     try:
         with urlopen(request, timeout=TIMEOUT_SECONDS) as resp:
             payload = _read_json(resp)
@@ -118,14 +137,14 @@ def send(token, chat_id, text, *, urlopen):
 def run(environ=None, *, urlopen=None, now=None):
     """로그 한 줄 문자열을 돌려준다. 예외를 밖으로 내보내지 않는다."""
     environ = os.environ if environ is None else environ
-    urlopen = urlopen or urllib.request.urlopen
+    urlopen = urlopen or _default_urlopen
     try:
         result, stage = current_result(environ.get("MONITOR_OUTCOME"), environ.get("JOB_STATUS"))
         if result in ("cancelled", "unknown"):
             return "notify: skipped (cancelled)" if result == "cancelled" else "notify: skipped (unknown outcome)"
         try:
             previous = previous_conclusion(environ.get("GITHUB_RUN_ID"), environ.get("GITHUB_REF_NAME"),
-                                           urlopen=urlopen)
+                                           urlopen=urlopen, api_token=environ.get("GH_API_TOKEN") or "")
         except HistoryUnavailable as missing:
             detail = f" ({missing.reason})" if missing.reason else ""
             return f"notify: skipped (history unavailable{detail})"

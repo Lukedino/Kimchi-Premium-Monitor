@@ -24,6 +24,7 @@ OWN_RUN_ID = 9001
 # 실제 토큰처럼 보이지 않도록 런타임에 조립한다.
 FAKE_TOKEN = "-".join(["synthetic", "notify", "credential", str(len(__file__) % 7)])
 FAKE_CHAT = "synthetic" + "-chat"
+FAKE_API_TOKEN = "".join(["synthetic", "-api-", "placeholder"])
 
 
 class FakeResponse:
@@ -54,6 +55,8 @@ class FakeUrlopen:
         self.send_ok = send_ok
         self.history_calls = 0
         self.history_urls = []
+        self.history_auth = []
+        self.telegram_headers = []
         self.sent = []
 
     def __call__(self, request, timeout=None):
@@ -63,6 +66,8 @@ class FakeUrlopen:
             self.history_calls += 1
             self.history_urls.append(url)
             assert request.data is None
+            self.history_auth.append(request.get_header("Authorization"))
+            # 리다이렉트로 넘어가지 않도록 unredirected 헤더로만 넣는다.
             assert "Authorization" not in request.headers
             if self.history_error:
                 raise self.history_error
@@ -71,6 +76,7 @@ class FakeUrlopen:
             if self.send_error:
                 raise self.send_error
             from urllib.parse import parse_qs
+            self.telegram_headers.append(dict(request.header_items()))
             fields = parse_qs(request.data.decode("utf-8"))
             self.sent.append(fields["text"][0])
             return FakeResponse({"ok": self.send_ok})
@@ -169,6 +175,28 @@ class TransitionTests(unittest.TestCase):
                 self.assertEqual(fake.history_calls, 0)
                 self.assertEqual(fake.sent, [])
 
+    def test_api_token_only_on_github_request(self):
+        fake = FakeUrlopen(("success",))
+        out, err = self.run_notify(env("failure", "failure", GH_API_TOKEN=FAKE_API_TOKEN), fake)
+        self.assertEqual(out.strip(), "notify: sent (failure)")
+        self.assertEqual(fake.history_auth, [f"Bearer {FAKE_API_TOKEN}"])
+        self.assertEqual(len(fake.telegram_headers), 1)
+        self.assertNotIn(FAKE_API_TOKEN, repr(fake.telegram_headers) + fake.sent[0] + out + err)
+
+    def test_without_api_token_history_is_anonymous(self):
+        fake = FakeUrlopen(("success",))
+        self.run_notify(env("failure", "failure"), fake)
+        self.assertEqual(fake.history_auth, [None])
+
+    def test_default_opener_does_not_follow_redirects(self):
+        handlers = nt._OPENER.handlers
+        self.assertTrue(any(isinstance(h, nt._NoRedirect) for h in handlers))
+        self.assertFalse(any(type(h) is nt.urllib.request.HTTPRedirectHandler for h in handlers))
+        request = nt.urllib.request.Request("https://api.github.com/x")
+        request.add_unredirected_header("Authorization", "Bearer " + FAKE_API_TOKEN)
+        self.assertIsNone(nt._NoRedirect().redirect_request(
+            request, None, 302, "Found", {}, "https://elsewhere.invalid/"))
+
     def test_skipped_counts_as_install_failure(self):
         fake = FakeUrlopen(("success",))
         out, _ = self.run_notify(env("skipped", "failure"), fake)
@@ -250,7 +278,7 @@ class EntryPointTests(unittest.TestCase):
                   if name.split(".")[0] in _BlockThirdParty.BLOCKED}
         sys.meta_path.insert(0, finder)
         try:
-            with patch.object(sys, "argv", ["monitor.py", "--notify-transition"]),                  patch.dict(os.environ, env("failure", "failure"), clear=True),                  patch.object(nt.urllib.request, "urlopen", fake),                  patch.object(socket, "socket", side_effect=AssertionError("network forbidden")),                  contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as exit_info:
+            with patch.object(sys, "argv", ["monitor.py", "--notify-transition"]),                  patch.dict(os.environ, env("failure", "failure"), clear=True),                  patch.object(nt, "_OPENER", type("FakeOpener", (), {"open": staticmethod(fake)})()),                  patch.object(socket, "socket", side_effect=AssertionError("network forbidden")),                  contextlib.redirect_stdout(out), self.assertRaises(SystemExit) as exit_info:
                 runpy.run_path(str(ROOT / "monitor.py"), run_name="__main__")
         finally:
             sys.meta_path.remove(finder)
@@ -294,7 +322,7 @@ class EntryPointTests(unittest.TestCase):
         self.assertIn("MONITOR_OUTCOME: ${{ steps.monitor.outcome }}", step)
         self.assertIn("JOB_STATUS: ${{ job.status }}", step)
         self.assertIn("python -B -S monitor.py --notify-transition", step)
-        self.assertNotIn("GITHUB_TOKEN", step)
+        self.assertIn("GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}", step)
         run_line = [line for line in step.splitlines() if line.strip().startswith("run:")]
         self.assertEqual(len(run_line), 1)
         self.assertNotIn("${{", run_line[0])

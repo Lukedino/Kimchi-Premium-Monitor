@@ -146,8 +146,10 @@ class OperatingWorkflowTests(unittest.TestCase):
         self.assertIn("continue-on-error: true", notify)
         self.assertIn("MONITOR_OUTCOME: ${{ steps.monitor.outcome }}", notify)
         self.assertIn("python -B -S monitor.py --notify-transition", notify)
-        self.assertNotIn("GITHUB_TOKEN", notify)
-        self.assertEqual(text.count("GITHUB_TOKEN"), 1)
+        self.assertIn("GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}", notify)
+        self.assertNotIn("KIMCHI_PUBLISH_TOKEN", notify)
+        self.assertEqual(text.count("GITHUB_TOKEN"), 2)
+        self.assertIn("     contents: write" + chr(10) + "     actions: read" + chr(10), text)
         self.assertIn("cron: '*/15 * * * *'", text)
         self.assertIn("cancel-in-progress: false", text)
 
