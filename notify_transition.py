@@ -1,0 +1,129 @@
+"""워크플로 성공↔실패 전이 때만 Telegram 1통 (무상태, 표준 라이브러리 전용).
+
+`python -B -S monitor.py --notify-transition` 으로 실행된다. 설치 단계가 실패해도
+돌도록 서드파티 패키지와 monitor.py 의 나머지 코드를 import 하지 않는다.
+
+- 이번 결과: MONITOR_OUTCOME(success|failure|cancelled|skipped) + JOB_STATUS.
+  skipped(앞 스텝 실패로 수집이 건너뛰어짐)는 실패로 본다. cancelled 는 보내지 않는다
+  (사람이 취소했거나 다음 실행에 밀린 것이라 실패도 회복도 아니다).
+- 직전 결과: 익명 GitHub REST 로 이 워크플로의 완료 run 을 받아 자기 run 을 뺀 뒤
+  success/failure 로 판정되는 첫 건. 조회 실패면 보내지 않는다(PA GHA 감시가 백업).
+- 공개 저장소다. 로그는 `notify: <sent|skipped|failed> (<고정 사유>)` 한 줄뿐이고
+  시세·임계값·URL·토큰·예외 문구를 싣지 않는다. 예외는 클래스 이름만 남긴다.
+- state.json 을 읽거나 쓰지 않는다. 종료 코드는 항상 0.
+"""
+import json
+import os
+import sys
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+KST = timezone(timedelta(hours=9))
+TIMEOUT_SECONDS = 10
+RUNS_URL = ("https://api.github.com/repos/Lukedino/Kimchi-Premium-Monitor/actions/workflows/"
+            "kimp-monitor.yml/runs?status=completed&per_page=5")
+HEADER = "김프 모니터(자체 알림)"
+# GitHub run conclusion → 판정. 여기 없는 값(cancelled·skipped·neutral 등)은 건너뛴다.
+_PREVIOUS = {"success": "success", "failure": "failure", "timed_out": "failure",
+             "startup_failure": "failure"}
+_STAGES = {"install": "설치", "collect": "수집", "publish": "게시"}
+
+
+class HistoryUnavailable(Exception):
+    pass
+
+
+def current_result(monitor_outcome, job_status):
+    """(결과, 단계). 결과는 success|failure|cancelled."""
+    outcome = (monitor_outcome or "").strip().lower()
+    job = (job_status or "").strip().lower()
+    if outcome == "cancelled" or job == "cancelled":
+        return "cancelled", None
+    if outcome == "skipped" or not outcome:
+        return "failure", "install"
+    if outcome == "failure":
+        return "failure", "collect"
+    if outcome == "success":
+        if job == "failure":
+            return "failure", "publish"
+        return "success", None
+    return "cancelled", None  # 알 수 없는 값은 판단하지 않는다
+
+
+def previous_conclusion(run_id, *, urlopen):
+    request = urllib.request.Request(RUNS_URL, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "kimp-monitor-notify",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    try:
+        with urlopen(request, timeout=TIMEOUT_SECONDS) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        runs = payload["workflow_runs"]
+        if not isinstance(runs, list):
+            raise TypeError
+    except Exception:
+        raise HistoryUnavailable from None
+    own = str(run_id or "")
+    for run in runs:
+        if not isinstance(run, dict) or str(run.get("id")) == own:
+            continue
+        verdict = _PREVIOUS.get(run.get("conclusion"))
+        if verdict:
+            return verdict
+    raise HistoryUnavailable
+
+
+def build_message(result, stage, now, run_number):
+    when = now.astimezone(KST).strftime("%Y-%m-%d %H:%M KST")
+    if result == "failure":
+        number = run_number if str(run_number or "").isdigit() else "?"
+        body = f"⚠️ 김프 모니터 실행 실패 · {when} · 단계 {_STAGES[stage]} · run #{number}"
+    else:
+        body = f"✅ 김프 모니터 회복 · {when}"
+    return f"{HEADER}\n{body}"
+
+
+def send(token, chat_id, text, *, urlopen):
+    data = urllib.parse.urlencode({"chat_id": chat_id, "text": text,
+                                   "disable_web_page_preview": "true"}).encode("utf-8")
+    request = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data,
+                                     headers={"Content-Type": "application/x-www-form-urlencoded"})
+    with urlopen(request, timeout=TIMEOUT_SECONDS) as resp:
+        payload = json.loads(resp.read().decode("utf-8"))
+    return isinstance(payload, dict) and payload.get("ok") is True
+
+
+def run(environ=None, *, urlopen=None, now=None):
+    """로그 한 줄 문자열을 돌려준다. 예외를 밖으로 내보내지 않는다."""
+    environ = os.environ if environ is None else environ
+    urlopen = urlopen or urllib.request.urlopen
+    try:
+        result, stage = current_result(environ.get("MONITOR_OUTCOME"), environ.get("JOB_STATUS"))
+        if result == "cancelled":
+            return "notify: skipped (cancelled)"
+        try:
+            previous = previous_conclusion(environ.get("GITHUB_RUN_ID"), urlopen=urlopen)
+        except HistoryUnavailable:
+            return "notify: skipped (history unavailable)"
+        if previous == result:
+            return "notify: skipped (no transition)"
+        token = environ.get("TELEGRAM_BOT_TOKEN") or ""
+        chat_id = environ.get("TELEGRAM_CHAT_ID") or ""
+        if not token or not chat_id:
+            return "notify: skipped (no credentials)"
+        text = build_message(result, stage, now or datetime.now(KST), environ.get("GITHUB_RUN_NUMBER"))
+        kind = "failure" if result == "failure" else "recovery"
+        if send(token, chat_id, text, urlopen=urlopen):
+            return f"notify: sent ({kind})"
+        return "notify: failed (not ok)"
+    except Exception as error:
+        # 예외 문자열에 토큰이 든 요청 URL 이 실릴 수 있어 클래스 이름만 남긴다.
+        return f"notify: failed ({type(error).__name__})"
+
+
+def main(environ=None, *, urlopen=None, now=None):
+    print(run(environ, urlopen=urlopen, now=now))
+    sys.stdout.flush()
+    return 0

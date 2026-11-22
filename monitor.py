@@ -9,6 +9,12 @@
 
 import os
 import sys
+
+if __name__ == "__main__" and sys.argv[1:] == ["--notify-transition"]:
+    # 설치 단계가 실패한 run 에서도 돌아야 하므로 다른 import 보다 먼저 분기한다(표준 라이브러리 전용).
+    from notify_transition import main as _notify_transition_main
+    sys.exit(_notify_transition_main())
+
 import json
 import re
 import math

@@ -50,3 +50,13 @@ jobs:
         env:
           KIMCHI_PUBLISH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python -B -S monitor.py --publish-only
+
+      - name: Notify on transition
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MONITOR_OUTCOME: ${{ steps.monitor.outcome }}
+          JOB_STATUS: ${{ job.status }}
+        run: python -B -S monitor.py --notify-transition
