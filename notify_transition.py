@@ -7,7 +7,7 @@
   skipped(앞 스텝 실패로 수집이 건너뛰어짐)는 실패로 본다. cancelled 는 보내지 않는다
   (사람이 취소했거나 다음 실행에 밀린 것이라 실패도 회복도 아니다). 빈 값·알 수 없는 값은
   `skipped (unknown outcome)` 로 따로 남긴다.
-- 직전 결과: 익명 GitHub REST 로 같은 브랜치(GITHUB_REF_NAME, 없으면 main)의 완료 run 을 받아 자기 run 을 뺀 뒤
+- 직전 결과: GitHub REST(아래 토큰, 없으면 익명)로 같은 브랜치(GITHUB_REF_NAME, 없으면 main)의 완료 run 을 받아 자기 run 을 뺀 뒤
   success/failure 로 판정되는 첫 건. 조회 실패면 보내지 않는다(PA GHA 감시가 백업).
 - GH_API_TOKEN(잡의 GITHUB_TOKEN, actions: read)이 있으면 api.github.com 조회에만 Bearer 로
   붙인다(익명 한도 60회/시 회피). 리다이렉트를 따르지 않는 opener 를 쓰고 헤더는 unredirected 로
