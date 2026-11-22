@@ -7,7 +7,9 @@ import os
 from pathlib import Path
 import runpy
 import socket
+import subprocess
 import sys
+import urllib.error
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -28,7 +30,8 @@ class FakeResponse:
     def __init__(self, payload):
         self._body = json.dumps(payload).encode("utf-8")
 
-    def read(self):
+    def read(self, limit=-1):
+        assert limit == nt.MAX_RESPONSE_BYTES
         return self._body
 
     def __enter__(self):
@@ -50,6 +53,7 @@ class FakeUrlopen:
         self.send_error = send_error
         self.send_ok = send_ok
         self.history_calls = 0
+        self.history_urls = []
         self.sent = []
 
     def __call__(self, request, timeout=None):
@@ -57,6 +61,7 @@ class FakeUrlopen:
         url = request.full_url
         if url.startswith("https://api.github.com/"):
             self.history_calls += 1
+            self.history_urls.append(url)
             assert request.data is None
             assert "Authorization" not in request.headers
             if self.history_error:
@@ -129,6 +134,40 @@ class TransitionTests(unittest.TestCase):
         bad_json.runs = "not-a-list"
         out, _ = self.run_notify(env("failure", "failure"), bad_json)
         self.assertEqual(out.strip(), "notify: skipped (history unavailable)")
+
+    def test_http_status_code_only_in_history_reason(self):
+        for code in (403, 429):
+            with self.subTest(code=code):
+                error = urllib.error.HTTPError(nt.RUNS_URL, code, "rate limit body text", {}, None)
+                fake = FakeUrlopen(history_error=error)
+                out, err = self.run_notify(env("failure", "failure"), fake)
+                self.assertEqual(out.strip(), f"notify: skipped (history unavailable (http {code}))")
+                self.assertNotIn("rate limit", out + err)
+                self.assertNotIn("api.github.com", out + err)
+                self.assertEqual(fake.sent, [])
+
+    def test_history_query_is_filtered_by_branch(self):
+        fake = FakeUrlopen(("success",))
+        self.run_notify(env("failure", "failure"), fake)
+        self.assertTrue(fake.history_urls[0].endswith("&branch=main"))
+        fake = FakeUrlopen(("success",))
+        self.run_notify(env("failure", "failure", GITHUB_REF_NAME="feat/a b&c"), fake)
+        self.assertTrue(fake.history_urls[0].endswith("&branch=feat%2Fa%20b%26c"))
+        self.assertIn("status=completed", fake.history_urls[0])
+
+    def test_previous_startup_failure_counts_as_failure(self):
+        fake = FakeUrlopen(("startup_failure",))
+        out, _ = self.run_notify(env("success", "success"), fake)
+        self.assertEqual(out.strip(), "notify: sent (recovery)")
+
+    def test_unknown_or_empty_outcome_is_distinct_from_cancelled(self):
+        for outcome, job in (("", "failure"), ("weird", "success"), ("success", ""), ("failure", "odd")):
+            with self.subTest(outcome=outcome, job=job):
+                fake = FakeUrlopen(("success",))
+                out, _ = self.run_notify(env(outcome, job), fake)
+                self.assertEqual(out.strip(), "notify: skipped (unknown outcome)")
+                self.assertEqual(fake.history_calls, 0)
+                self.assertEqual(fake.sent, [])
 
     def test_skipped_counts_as_install_failure(self):
         fake = FakeUrlopen(("success",))
@@ -233,6 +272,20 @@ class EntryPointTests(unittest.TestCase):
             sys.meta_path.remove(finder)
             sys.modules.update(cached)
 
+    def test_isolated_subprocess_cancelled_path(self):
+        # 워크플로와 같은 `-B -S`(스크립트 폴더가 sys.path 에 있어야 하므로 -I 는 쓰지 않음),
+        # PYTHON* 등 환경 변수는 넘기지 않는다. 취소 경로라 네트워크를 쓰지 않는다.
+        child_env = {k: v for k, v in os.environ.items()
+                     if k.upper() in {"SYSTEMROOT", "PATH", "TEMP", "TMP"}}
+        child_env.update(MONITOR_OUTCOME="cancelled", JOB_STATUS="cancelled",
+                         TELEGRAM_BOT_TOKEN=FAKE_TOKEN, TELEGRAM_CHAT_ID=FAKE_CHAT)
+        done = subprocess.run([sys.executable, "-S", "-B", "-X", "utf8", str(ROOT / "monitor.py"), "--notify-transition"],
+                              cwd=str(ROOT), env=child_env, capture_output=True, text=True,
+                              encoding="utf-8", timeout=30)
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(done.stdout.strip(), "notify: skipped (cancelled)")
+        self.assertEqual(done.stderr, "")
+
     def test_workflow_step_contract(self):
         text = (ROOT / ".github/workflows/kimp-monitor.yml").read_text(encoding="utf-8")
         step = text.split("      - name: Notify on transition", 1)[1]
@@ -242,6 +295,9 @@ class EntryPointTests(unittest.TestCase):
         self.assertIn("JOB_STATUS: ${{ job.status }}", step)
         self.assertIn("python -B -S monitor.py --notify-transition", step)
         self.assertNotIn("GITHUB_TOKEN", step)
+        run_line = [line for line in step.splitlines() if line.strip().startswith("run:")]
+        self.assertEqual(len(run_line), 1)
+        self.assertNotIn("${{", run_line[0])
 
 
 if __name__ == "__main__":

@@ -5,8 +5,9 @@
 
 - 이번 결과: MONITOR_OUTCOME(success|failure|cancelled|skipped) + JOB_STATUS.
   skipped(앞 스텝 실패로 수집이 건너뛰어짐)는 실패로 본다. cancelled 는 보내지 않는다
-  (사람이 취소했거나 다음 실행에 밀린 것이라 실패도 회복도 아니다).
-- 직전 결과: 익명 GitHub REST 로 이 워크플로의 완료 run 을 받아 자기 run 을 뺀 뒤
+  (사람이 취소했거나 다음 실행에 밀린 것이라 실패도 회복도 아니다). 빈 값·알 수 없는 값은
+  `skipped (unknown outcome)` 로 따로 남긴다.
+- 직전 결과: 익명 GitHub REST 로 같은 브랜치(GITHUB_REF_NAME, 없으면 main)의 완료 run 을 받아 자기 run 을 뺀 뒤
   success/failure 로 판정되는 첫 건. 조회 실패면 보내지 않는다(PA GHA 감시가 백업).
 - 공개 저장소다. 로그는 `notify: <sent|skipped|failed> (<고정 사유>)` 한 줄뿐이고
   시세·임계값·URL·토큰·예외 문구를 싣지 않는다. 예외는 클래스 이름만 남긴다.
@@ -15,12 +16,14 @@
 import json
 import os
 import sys
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
 KST = timezone(timedelta(hours=9))
 TIMEOUT_SECONDS = 10
+MAX_RESPONSE_BYTES = 1_000_000
 RUNS_URL = ("https://api.github.com/repos/Lukedino/Kimchi-Premium-Monitor/actions/workflows/"
             "kimp-monitor.yml/runs?status=completed&per_page=5")
 HEADER = "김프 모니터(자체 알림)"
@@ -31,16 +34,30 @@ _STAGES = {"install": "설치", "collect": "수집", "publish": "게시"}
 
 
 class HistoryUnavailable(Exception):
-    pass
+    """reason 은 고정 문구 또는 `http <숫자>` 뿐이다(URL·본문 금지)."""
+
+    def __init__(self, reason=""):
+        super().__init__(reason)
+        self.reason = reason
+
+
+def runs_url(branch):
+    return f"{RUNS_URL}&branch={urllib.parse.quote(branch or 'main', safe='')}"
+
+
+def _read_json(resp):
+    return json.loads(resp.read(MAX_RESPONSE_BYTES).decode("utf-8"))
 
 
 def current_result(monitor_outcome, job_status):
-    """(결과, 단계). 결과는 success|failure|cancelled."""
+    """(결과, 단계). 결과는 success|failure|cancelled|unknown."""
     outcome = (monitor_outcome or "").strip().lower()
     job = (job_status or "").strip().lower()
     if outcome == "cancelled" or job == "cancelled":
         return "cancelled", None
-    if outcome == "skipped" or not outcome:
+    if job not in {"success", "failure"}:
+        return "unknown", None
+    if outcome == "skipped":
         return "failure", "install"
     if outcome == "failure":
         return "failure", "collect"
@@ -48,21 +65,24 @@ def current_result(monitor_outcome, job_status):
         if job == "failure":
             return "failure", "publish"
         return "success", None
-    return "cancelled", None  # 알 수 없는 값은 판단하지 않는다
+    return "unknown", None  # 빈 값·알 수 없는 값은 판단하지 않는다
 
 
-def previous_conclusion(run_id, *, urlopen):
-    request = urllib.request.Request(RUNS_URL, headers={
+def previous_conclusion(run_id, branch, *, urlopen):
+    request = urllib.request.Request(runs_url(branch), headers={
         "Accept": "application/vnd.github+json",
         "User-Agent": "kimp-monitor-notify",
         "X-GitHub-Api-Version": "2022-11-28",
     })
     try:
         with urlopen(request, timeout=TIMEOUT_SECONDS) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+            payload = _read_json(resp)
         runs = payload["workflow_runs"]
         if not isinstance(runs, list):
             raise TypeError
+    except urllib.error.HTTPError as error:
+        code = error.code if isinstance(error.code, int) else 0
+        raise HistoryUnavailable(f"http {code}") from None
     except Exception:
         raise HistoryUnavailable from None
     own = str(run_id or "")
@@ -91,7 +111,7 @@ def send(token, chat_id, text, *, urlopen):
     request = urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data,
                                      headers={"Content-Type": "application/x-www-form-urlencoded"})
     with urlopen(request, timeout=TIMEOUT_SECONDS) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
+        payload = _read_json(resp)
     return isinstance(payload, dict) and payload.get("ok") is True
 
 
@@ -101,12 +121,14 @@ def run(environ=None, *, urlopen=None, now=None):
     urlopen = urlopen or urllib.request.urlopen
     try:
         result, stage = current_result(environ.get("MONITOR_OUTCOME"), environ.get("JOB_STATUS"))
-        if result == "cancelled":
-            return "notify: skipped (cancelled)"
+        if result in ("cancelled", "unknown"):
+            return "notify: skipped (cancelled)" if result == "cancelled" else "notify: skipped (unknown outcome)"
         try:
-            previous = previous_conclusion(environ.get("GITHUB_RUN_ID"), urlopen=urlopen)
-        except HistoryUnavailable:
-            return "notify: skipped (history unavailable)"
+            previous = previous_conclusion(environ.get("GITHUB_RUN_ID"), environ.get("GITHUB_REF_NAME"),
+                                           urlopen=urlopen)
+        except HistoryUnavailable as missing:
+            detail = f" ({missing.reason})" if missing.reason else ""
+            return f"notify: skipped (history unavailable{detail})"
         if previous == result:
             return "notify: skipped (no transition)"
         token = environ.get("TELEGRAM_BOT_TOKEN") or ""
