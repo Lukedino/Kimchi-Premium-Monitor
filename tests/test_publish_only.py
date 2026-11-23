@@ -128,6 +128,7 @@ class OperatingWorkflowTests(unittest.TestCase):
         install = text.split("      - name: Install dependencies", 1)[1].split("      - name: Run monitor", 1)[0]
         collect, publish = text.split("      - name: Run monitor", 1)[1].split(
             "      - name: Publish saved state", 1)
+        publish, notify = publish.split("      - name: Notify on transition", 1)
         self.assertIn("persist-credentials: false", text)
         self.assertIn("--require-hashes -r locks/runtime-linux.txt", install)
         self.assertNotIn("secrets.", install)
@@ -141,7 +142,14 @@ class OperatingWorkflowTests(unittest.TestCase):
         self.assertIn("KIMCHI_PUBLISH_TOKEN: ${{ secrets.GITHUB_TOKEN }}", publish)
         self.assertIn("python -B -S monitor.py --publish-only", publish)
         self.assertNotIn("TELEGRAM", publish)
-        self.assertEqual(text.count("GITHUB_TOKEN"), 1)
+        self.assertIn("always()", notify)
+        self.assertIn("continue-on-error: true", notify)
+        self.assertIn("MONITOR_OUTCOME: ${{ steps.monitor.outcome }}", notify)
+        self.assertIn("python -B -S monitor.py --notify-transition", notify)
+        self.assertIn("GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}", notify)
+        self.assertNotIn("KIMCHI_PUBLISH_TOKEN", notify)
+        self.assertEqual(text.count("GITHUB_TOKEN"), 2)
+        self.assertIn("     contents: write" + chr(10) + "     actions: read" + chr(10), text)
         self.assertIn("cron: '*/15 * * * *'", text)
         self.assertIn("cancel-in-progress: false", text)
 
